@@ -65,7 +65,19 @@ mainline work rather than silent fake success.
 The census has continued through fixed Tokyo time-zone/system-time data,
 write-range validation, sandboxed file copying, mutable standard handles synced
 to process parameters, ANSI environment aliases, locale validation/info, and a
-real single-locale Host-to-Guest enumeration callback. The current observed
-unresolved import is `SetEndOfFile`. No real User32 window has been created yet.
-The HD executable remains useful as a comparison path but is not the primary
-target.
+real single-locale Host-to-Guest enumeration callback.
+
+The latest compatibility pass added a complete writable file-handle lifecycle,
+including creation dispositions, buffered writes, flush-on-close, and
+`SetEndOfFile`. Software `RaiseException` calls now enter the real Guest SEH
+chain with exception flags and information records. Environment mutations
+rebuild the ANSI/UTF-16 process blocks and update the PEB, while pointer probes,
+string helpers, file/directory removal, and system-directory queries cover the
+remaining observed Kernel32 imports.
+
+The child has now crossed the Kernel32 import census and entered `user32.dll`.
+It has resolved window-text, cursor, and client/screen coordinate helpers; the
+current observed unresolved import is `SetClassLongA`. No real User32 window has
+been created yet, but the active frontier is now the window-class and window
+creation layer rather than the unpacker or interpreter core. The HD executable
+remains useful as a comparison path but is not the primary target.

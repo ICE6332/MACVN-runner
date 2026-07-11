@@ -342,6 +342,71 @@ fn dispatches_int3_through_the_guest_seh_chain() {
 }
 
 #[test]
+fn dispatches_software_exception_information_through_seh() {
+    let image = image_with_one_import();
+    let mut runtime = Runtime::load(&image, ApiRegistry::new()).expect("image should load");
+    runtime
+        .memory
+        .map_range(GuestAddress(0x3000), PAGE_SIZE_U32, Permissions::ALL)
+        .unwrap();
+    runtime.memory.write(GuestAddress(0x3000), &[0xf4]).unwrap();
+    runtime
+        .memory
+        .write(GuestAddress(0x3010), &[0x31, 0xc0, 0xc3])
+        .unwrap();
+    let registration = GuestAddress(GUEST_STACK_TOP - 0x20);
+    runtime.memory.write_u32(registration, u32::MAX).unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(registration.0 + 4), 0x3010)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(GUEST_TEB_BASE), registration.0)
+        .unwrap();
+    runtime.cpu.state.registers.eip = 0x3000;
+    runtime.cpu.state.registers.esp = GUEST_STACK_TOP - 0x100;
+
+    runtime
+        .dispatch_guest_exception(0xe042_4242, 0, GuestAddress(0x3000), &[0x1111, 0x2222])
+        .unwrap();
+    let context = (GUEST_STACK_TOP - 0x100 - 0x2cc) & !0xf;
+    let record = GuestAddress(context - 0x50);
+    assert_eq!(runtime.memory.read_u32(record).unwrap(), 0xe042_4242);
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(GuestAddress(record.0 + 16))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(GuestAddress(record.0 + 20))
+            .unwrap(),
+        0x1111
+    );
+    assert_eq!(
+        runtime
+            .memory
+            .read_u32(GuestAddress(record.0 + 24))
+            .unwrap(),
+        0x2222
+    );
+
+    assert_eq!(
+        runtime
+            .run(RunLimits {
+                max_instructions: 16,
+            })
+            .unwrap(),
+        RunOutcome::Halted
+    );
+    assert!(runtime.pending_exception.is_none());
+}
+
+#[test]
 fn runs_compiler_generated_pe32_fixture() {
     let image = include_bytes!("../../../tests/guest-programs/exit42.exe");
     let parsed_image = vnrt_pe::parse(image).expect("fixture metadata should parse");

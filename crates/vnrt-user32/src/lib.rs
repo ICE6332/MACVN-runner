@@ -94,11 +94,15 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "MonitorFromPoint"), MonitorFromPoint);
     registry.register(ApiKey::new(MODULE, "GetMonitorInfoA"), GetMonitorInfoA);
     registry.register(ApiKey::new(MODULE, "ShowCursor"), ShowCursor);
+    registry.register(ApiKey::new(MODULE, "SetCursor"), SetCursor);
+    registry.register(ApiKey::new(MODULE, "ClientToScreen"), ConvertWindowPoint);
+    registry.register(ApiKey::new(MODULE, "ScreenToClient"), ConvertWindowPoint);
     registry.register(ApiKey::new(MODULE, "GetSystemMenu"), GetSystemMenu);
     registry.register(ApiKey::new(MODULE, "DeleteMenu"), DeleteMenu);
     registry.register(ApiKey::new(MODULE, "DrawMenuBar"), DrawMenuBar);
     registry.register(ApiKey::new(MODULE, "GetDlgItem"), GetDlgItem);
     registry.register(ApiKey::new(MODULE, "SetWindowTextA"), SetWindowTextA);
+    registry.register(ApiKey::new(MODULE, "GetWindowTextA"), GetWindowTextA);
     registry.register(ApiKey::new(MODULE, "SendMessageA"), SendMessageA);
     registry.register(ApiKey::new(MODULE, "SetFocus"), SetFocus);
     registry.register(ApiKey::new(MODULE, "DialogBoxParamA"), DialogBoxParamA);
@@ -108,6 +112,37 @@ pub fn register(registry: &mut ApiRegistry) {
 
 #[derive(Debug, Clone, Copy)]
 struct GetDc;
+
+#[derive(Debug, Clone, Copy)]
+struct SetCursor;
+
+#[derive(Debug, Clone, Copy)]
+struct ConvertWindowPoint;
+
+impl HostCallHandler for ConvertWindowPoint {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let point = GuestAddress(context.argument_u32(1)?);
+        // Pseudo windows currently sit at the screen origin, making client and
+        // screen coordinates identical. Still validate the complete POINT.
+        let mut coordinates = [0; 8];
+        context.read_memory(point, &mut coordinates)?;
+        context.set_return_u32(u32::from(window != 0));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetCursor {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let cursor = context.argument_u32(0)?;
+        // Cursor resources are not native objects yet. Returning the modeled
+        // cursor keeps the common save/set/restore pattern internally stable.
+        context.set_return_u32(cursor);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for GetDc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -328,6 +363,28 @@ impl HostCallHandler for GetDlgItem {
 
 #[derive(Debug, Clone, Copy)]
 struct SetWindowTextA;
+
+#[derive(Debug, Clone, Copy)]
+struct GetWindowTextA;
+
+impl HostCallHandler for GetWindowTextA {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let output = GuestAddress(context.argument_u32(1)?);
+        let capacity = context.argument_u32(2)?;
+        if window == 0 {
+            context.set_last_error(1400); // ERROR_INVALID_WINDOW_HANDLE
+        } else if capacity != 0 {
+            context.write_memory(output, &[0])?;
+            context.set_last_error(0);
+        }
+        // Window title storage moves into the native-window registry when
+        // CreateWindowEx is implemented. Existing pseudo windows have no title.
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(12);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for SetWindowTextA {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {

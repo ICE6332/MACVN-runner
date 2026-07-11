@@ -121,6 +121,10 @@ pub trait VirtualFileSystem: Send + Sync {
     fn write(&self, path: &str, bytes: &[u8]) -> Result<(), Win32Error>;
     /// Create one directory below the configured Guest root.
     fn create_directory(&self, path: &str) -> Result<(), Win32Error>;
+    /// Remove one empty directory below the configured Guest root.
+    fn remove_directory(&self, path: &str) -> Result<(), Win32Error>;
+    /// Remove one file below the configured Guest root.
+    fn remove_file(&self, path: &str) -> Result<(), Win32Error>;
     /// Query metadata for one existing guest-visible path.
     fn metadata(&self, path: &str) -> Result<FileMetadata, Win32Error>;
     /// Enumerate entries matching one guest-relative wildcard pattern.
@@ -167,6 +171,18 @@ impl VirtualFileSystem for UnsupportedFileSystem {
     fn create_directory(&self, _path: &str) -> Result<(), Win32Error> {
         Err(Win32Error::Unsupported {
             feature: "virtual filesystem directory creation",
+        })
+    }
+
+    fn remove_directory(&self, _path: &str) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem directory removal",
+        })
+    }
+
+    fn remove_file(&self, _path: &str) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem file removal",
         })
     }
 
@@ -315,6 +331,24 @@ impl VirtualFileSystem for SandboxFileSystem {
         })
     }
 
+    fn remove_directory(&self, path: &str) -> Result<(), Win32Error> {
+        let resolved = self.resolve_existing(path)?;
+        fs::remove_dir(&resolved).map_err(|error| Win32Error::Io {
+            operation: "remove directory",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), Win32Error> {
+        let resolved = self.resolve_existing(path)?;
+        fs::remove_file(&resolved).map_err(|error| Win32Error::Io {
+            operation: "remove file",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
     fn metadata(&self, path: &str) -> Result<FileMetadata, Win32Error> {
         let resolved = self.resolve_existing(path)?;
         let metadata = fs::metadata(&resolved).map_err(|error| Win32Error::Io {
@@ -406,8 +440,12 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 }
 
 struct OpenFile {
+    path: String,
     bytes: Vec<u8>,
     cursor: usize,
+    readable: bool,
+    writable: bool,
+    dirty: bool,
 }
 
 struct DirectorySearch {
@@ -436,8 +474,64 @@ impl ProcessIo {
 
     /// Open a guest path for sequential reading.
     pub fn open_read(&mut self, path: &str) -> Result<Handle, Win32Error> {
-        let bytes = self.filesystem.read(path)?;
-        self.files.insert(OpenFile { bytes, cursor: 0 })
+        self.open(path, true, false, 3).map(|(handle, _)| handle)
+    }
+
+    /// Open or create a Guest file with Win32 creation-disposition semantics.
+    pub fn open(
+        &mut self,
+        path: &str,
+        readable: bool,
+        writable: bool,
+        disposition: u32,
+    ) -> Result<(Handle, bool), Win32Error> {
+        let existing = self.filesystem.read(path).ok();
+        let existed = existing.is_some();
+        let (bytes, create_empty) = match disposition {
+            1 if existed => {
+                return Err(Win32Error::Io {
+                    operation: "create",
+                    path: path.to_owned(),
+                    message: "file already exists".to_owned(),
+                });
+            }
+            1 => (Vec::new(), true), // CREATE_NEW
+            2 => (Vec::new(), true), // CREATE_ALWAYS
+            3 => (
+                existing.ok_or_else(|| Win32Error::Io {
+                    operation: "open",
+                    path: path.to_owned(),
+                    message: "file does not exist".to_owned(),
+                })?,
+                false,
+            ), // OPEN_EXISTING
+            4 => (existing.unwrap_or_default(), !existed), // OPEN_ALWAYS
+            5 if existed && writable => (Vec::new(), true), // TRUNCATE_EXISTING
+            5 => {
+                return Err(Win32Error::Io {
+                    operation: "truncate",
+                    path: path.to_owned(),
+                    message: "file does not exist or is not writable".to_owned(),
+                });
+            }
+            _ => {
+                return Err(Win32Error::InvalidArgument(
+                    "invalid file creation disposition",
+                ));
+            }
+        };
+        if create_empty {
+            self.filesystem.write(path, &bytes)?;
+        }
+        let handle = self.files.insert(OpenFile {
+            path: path.to_owned(),
+            bytes,
+            cursor: 0,
+            readable,
+            writable,
+            dirty: false,
+        })?;
+        Ok((handle, existed))
     }
 
     /// Read at most `length` bytes and advance the file cursor.
@@ -446,6 +540,9 @@ impl ProcessIo {
             .files
             .get_mut(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if !file.readable {
+            return Err(Win32Error::InvalidHandle(handle.0));
+        }
         if file.cursor >= file.bytes.len() {
             return Ok(Vec::new());
         }
@@ -458,6 +555,16 @@ impl ProcessIo {
     /// Create one Guest directory within the configured filesystem root.
     pub fn create_directory(&self, path: &str) -> Result<(), Win32Error> {
         self.filesystem.create_directory(path)
+    }
+
+    /// Remove one empty Guest directory within the filesystem root.
+    pub fn remove_directory(&self, path: &str) -> Result<(), Win32Error> {
+        self.filesystem.remove_directory(path)
+    }
+
+    /// Remove one Guest file within the filesystem root.
+    pub fn remove_file(&self, path: &str) -> Result<(), Win32Error> {
+        self.filesystem.remove_file(path)
     }
 
     /// Return Win32 file attributes for one Guest path.
@@ -486,10 +593,63 @@ impl ProcessIo {
 
     /// Close a file handle.
     pub fn close(&mut self, handle: Handle) -> Result<(), Win32Error> {
-        self.files
+        let file = self
+            .files
             .remove(handle)
-            .map(|_| ())
-            .ok_or(Win32Error::InvalidHandle(handle.0))
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if file.dirty {
+            self.filesystem.write(&file.path, &file.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Write bytes at the current cursor and advance it.
+    pub fn write(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, Win32Error> {
+        let file = self
+            .files
+            .get_mut(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if !file.writable {
+            return Err(Win32Error::InvalidHandle(handle.0));
+        }
+        let end = file
+            .cursor
+            .checked_add(bytes.len())
+            .ok_or(Win32Error::OutOfMemory)?;
+        if file.bytes.len() < end {
+            file.bytes.resize(end, 0);
+        }
+        file.bytes[file.cursor..end].copy_from_slice(bytes);
+        file.cursor = end;
+        file.dirty = true;
+        Ok(bytes.len())
+    }
+
+    /// Resize a writable file to its current cursor position.
+    pub fn set_end(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        let file = self
+            .files
+            .get_mut(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if !file.writable {
+            return Err(Win32Error::InvalidHandle(handle.0));
+        }
+        file.bytes.resize(file.cursor, 0);
+        file.dirty = true;
+        Ok(())
+    }
+
+    /// Persist pending writes for one file handle.
+    pub fn flush(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        let file = self
+            .files
+            .get_mut(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if file.dirty {
+            self.filesystem.write(&file.path, &file.bytes)?;
+            file.dirty = false;
+        }
+        Ok(())
     }
 
     /// Start a wildcard directory search and return its first result.
@@ -626,6 +786,13 @@ pub trait HostCallContext {
     fn write_memory(&mut self, address: GuestAddress, bytes: &[u8]) -> Result<(), Win32Error>;
     /// Request clean process termination.
     fn request_exit(&mut self, code: u32);
+    /// Raise software exception through Guest SEH after this Host call returns.
+    fn raise_guest_exception(
+        &mut self,
+        code: u32,
+        flags: u32,
+        information: &[u32],
+    ) -> Result<(), Win32Error>;
     /// Milliseconds elapsed on the runtime's monotonic process clock.
     fn tick_count(&self) -> u32;
     /// Nanosecond-frequency monotonic performance-counter value.
@@ -717,6 +884,10 @@ pub trait HostCallContext {
     ) -> Result<(bool, bool, bool), Win32Error>;
     /// Test whether every page in a Guest range permits writes.
     fn is_memory_writable(&self, address: GuestAddress, size: u32) -> bool;
+    /// Test whether every page in a Guest range permits reads.
+    fn is_memory_readable(&self, address: GuestAddress, size: u32) -> bool;
+    /// Test whether a Guest address is mapped executable code.
+    fn is_memory_executable(&self, address: GuestAddress) -> bool;
     /// Release a complete virtual-memory allocation.
     fn free_virtual_memory(&mut self, address: GuestAddress) -> Result<(), Win32Error>;
     /// Look up a loaded Host module by normalized DLL name.
@@ -743,12 +914,28 @@ pub trait HostCallContext {
     fn replace_process_error_mode(&mut self, mode: u32) -> u32;
     /// Open a VFS path for sequential reading.
     fn open_file_read(&mut self, path: &str) -> Result<Handle, Win32Error>;
+    /// Open or create a VFS file and report whether it previously existed.
+    fn open_file(
+        &mut self,
+        path: &str,
+        readable: bool,
+        writable: bool,
+        disposition: u32,
+    ) -> Result<(Handle, bool), Win32Error>;
     /// Read bytes from an open file and advance its cursor.
     fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error>;
+    /// Resize a writable file to its current cursor.
+    fn set_end_of_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Persist pending writes for one file handle.
+    fn flush_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
     /// Close an open file handle.
     fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
     /// Create one directory inside the configured Guest filesystem root.
     fn create_directory(&mut self, path: &str) -> Result<(), Win32Error>;
+    /// Remove one empty directory inside the Guest filesystem root.
+    fn remove_directory(&mut self, path: &str) -> Result<(), Win32Error>;
+    /// Remove one file inside the Guest filesystem root.
+    fn remove_file(&mut self, path: &str) -> Result<(), Win32Error>;
     /// Return Win32 file-attribute flags for one guest-visible path.
     fn file_attributes(&self, path: &str) -> Result<u32, Win32Error>;
     /// Copy one guest-visible file within the filesystem sandbox.
@@ -811,6 +998,12 @@ pub trait HostCallContext {
     fn file_type(&self, handle: Handle) -> Option<u32>;
     /// Look up one case-insensitive process environment value.
     fn environment_variable(&self, name: &str) -> Option<&str>;
+    /// Set or delete one case-insensitive process environment value.
+    fn set_environment_variable(
+        &mut self,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<(), Win32Error>;
     /// Runtime-owned double-NUL ANSI environment block.
     fn environment_block_ansi(&self) -> GuestAddress;
     /// Runtime-owned double-NUL UTF-16 environment block.
@@ -1115,5 +1308,31 @@ mod tests {
         assert!(wildcard_matches("*.ypf", "CG.YPF"));
         assert!(wildcard_matches("update?.ypf", "update3.ypf"));
         assert!(!wildcard_matches("*.ypf", "cg.ypf_old"));
+    }
+
+    #[test]
+    fn writable_file_handles_flush_and_truncate_at_the_cursor() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("vnrt-process-io-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut io = ProcessIo::sandboxed(&root, r"C:\GAME");
+
+        let (handle, existed) = io.open("save.dat", true, true, 2).unwrap();
+        assert!(!existed);
+        assert_eq!(io.write(handle, b"abcdef").unwrap(), 6);
+        assert_eq!(io.seek(handle, 3, 0).unwrap(), 3);
+        io.set_end(handle).unwrap();
+        io.flush(handle).unwrap();
+        assert_eq!(fs::read(root.join("save.dat")).unwrap(), b"abc");
+        io.close(handle).unwrap();
+
+        let handle = io.open_read("SAVE.DAT").unwrap();
+        assert_eq!(io.read(handle, 8).unwrap(), b"abc");
+        io.close(handle).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

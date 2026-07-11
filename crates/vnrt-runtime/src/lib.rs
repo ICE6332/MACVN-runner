@@ -696,14 +696,15 @@ impl Runtime {
             guest_stdout: &mut self.guest_stdout,
             guest_stderr: &mut self.guest_stderr,
             standard_handles: &mut self.standard_handles,
-            environment: &self.environment,
+            environment: &mut self.environment,
             current_directory: &mut self.current_directory,
-            environment_block_ansi: self.environment_block_ansi,
-            environment_block_utf16: self.environment_block_utf16,
+            environment_block_ansi: &mut self.environment_block_ansi,
+            environment_block_utf16: &mut self.environment_block_utf16,
             guest_callbacks: VecDeque::new(),
             suspended_host_calls: &mut self.suspended_host_calls,
             guest_callback_targets: &mut self.guest_callback_targets,
             capture_callback_return: false,
+            raised_exception: None,
         };
         let invocation = handler.invoke(&mut context);
         context.memory.write_u32(
@@ -714,7 +715,18 @@ impl Runtime {
         if context.exit_code.is_none() {
             if context.guest_callbacks.is_empty() {
                 context.finish_host_return()?;
+                let raised_exception = context.raised_exception.take();
+                drop(context);
+                if let Some((code, flags, information)) = raised_exception {
+                    let address = GuestAddress(self.cpu.state.registers.eip);
+                    self.dispatch_guest_exception(code, flags, address, &information)?;
+                }
             } else {
+                if context.raised_exception.is_some() {
+                    return Err(RuntimeError::Unsupported(
+                        "Host call requested callbacks and an exception",
+                    ));
+                }
                 let stack = context.cpu.state.registers.esp;
                 let return_address = context.memory.read_u32(GuestAddress(stack))?;
                 let resumed_stack_pointer = stack

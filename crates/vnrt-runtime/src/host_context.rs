@@ -32,14 +32,15 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) guest_stdout: &'a mut Vec<u8>,
     pub(super) guest_stderr: &'a mut Vec<u8>,
     pub(super) standard_handles: &'a mut [u32; 3],
-    pub(super) environment: &'a BTreeMap<String, String>,
+    pub(super) environment: &'a mut BTreeMap<String, String>,
     pub(super) current_directory: &'a mut String,
-    pub(super) environment_block_ansi: GuestAddress,
-    pub(super) environment_block_utf16: GuestAddress,
+    pub(super) environment_block_ansi: &'a mut GuestAddress,
+    pub(super) environment_block_utf16: &'a mut GuestAddress,
     pub(super) guest_callbacks: VecDeque<GuestCallback>,
     pub(super) suspended_host_calls: &'a mut Vec<SuspendedHostCall>,
     pub(super) guest_callback_targets: &'a mut HashMap<u32, GuestAddress>,
     pub(super) capture_callback_return: bool,
+    pub(super) raised_exception: Option<(u32, u32, Vec<u32>)>,
 }
 
 impl RuntimeHostContext<'_> {
@@ -149,6 +150,21 @@ impl HostCallContext for RuntimeHostContext<'_> {
     fn request_exit(&mut self, code: u32) {
         *self.exit_code = Some(code);
         self.cpu.state.halted = true;
+    }
+
+    fn raise_guest_exception(
+        &mut self,
+        code: u32,
+        flags: u32,
+        information: &[u32],
+    ) -> Result<(), Win32Error> {
+        if self.raised_exception.is_some() {
+            return Err(Win32Error::InvalidArgument(
+                "multiple exceptions from one Host call",
+            ));
+        }
+        self.raised_exception = Some((code, flags, information.to_vec()));
+        Ok(())
     }
 
     fn tick_count(&self) -> u32 {
@@ -396,6 +412,39 @@ impl HostCallContext for RuntimeHostContext<'_> {
         }
     }
 
+    fn is_memory_readable(&self, address: GuestAddress, size: u32) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let Some(last) = address.0.checked_add(size - 1) else {
+            return false;
+        };
+        let mut page = address.page_base().0;
+        let last_page = GuestAddress(last).page_base().0;
+        loop {
+            if !self
+                .memory
+                .permissions_at(GuestAddress(page))
+                .is_some_and(|permissions| permissions.read)
+            {
+                return false;
+            }
+            if page == last_page {
+                return true;
+            }
+            let Some(next) = page.checked_add(PAGE_SIZE_U32) else {
+                return false;
+            };
+            page = next;
+        }
+    }
+
+    fn is_memory_executable(&self, address: GuestAddress) -> bool {
+        self.memory
+            .permissions_at(address)
+            .is_some_and(|permissions| permissions.execute)
+    }
+
     fn loaded_module_handle(&self, name: &str) -> Option<GuestAddress> {
         let mut normalized = name.to_ascii_lowercase();
         if !normalized.contains('.') {
@@ -471,8 +520,26 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.process_io.open_read(path)
     }
 
+    fn open_file(
+        &mut self,
+        path: &str,
+        readable: bool,
+        writable: bool,
+        disposition: u32,
+    ) -> Result<(Handle, bool), Win32Error> {
+        self.process_io.open(path, readable, writable, disposition)
+    }
+
     fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error> {
         self.process_io.read(handle, length)
+    }
+
+    fn set_end_of_file(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        self.process_io.set_end(handle)
+    }
+
+    fn flush_file(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        self.process_io.flush(handle)
     }
 
     fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error> {
@@ -481,6 +548,14 @@ impl HostCallContext for RuntimeHostContext<'_> {
 
     fn create_directory(&mut self, path: &str) -> Result<(), Win32Error> {
         self.process_io.create_directory(path)
+    }
+
+    fn remove_directory(&mut self, path: &str) -> Result<(), Win32Error> {
+        self.process_io.remove_directory(path)
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), Win32Error> {
+        self.process_io.remove_file(path)
     }
 
     fn file_attributes(&self, path: &str) -> Result<u32, Win32Error> {
@@ -632,6 +707,9 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn write_handle(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, Win32Error> {
+        if self.process_io.contains(handle) {
+            return self.process_io.write(handle, bytes);
+        }
         if handle.0 == self.standard_handles[1] {
             self.guest_stdout.extend_from_slice(bytes);
         } else if handle.0 == self.standard_handles[2] {
@@ -662,12 +740,53 @@ impl HostCallContext for RuntimeHostContext<'_> {
             .map(String::as_str)
     }
 
+    fn set_environment_variable(
+        &mut self,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<(), Win32Error> {
+        if name.is_empty() || name.contains('=') {
+            return Err(Win32Error::InvalidArgument("environment variable name"));
+        }
+        let key = name.to_ascii_uppercase();
+        if let Some(value) = value {
+            self.environment.insert(key, value.to_owned());
+        } else {
+            self.environment.remove(&key);
+        }
+        let ansi = encode_environment_block_ansi(self.environment);
+        let utf16 = encode_environment_block_utf16(self.environment);
+        let ansi_address = self.allocate_virtual_memory(
+            u32::try_from(ansi.len()).map_err(|_| Win32Error::OutOfMemory)?,
+            true,
+            true,
+            false,
+        )?;
+        let utf16_address = self.allocate_virtual_memory(
+            u32::try_from(utf16.len()).map_err(|_| Win32Error::OutOfMemory)?,
+            true,
+            true,
+            false,
+        )?;
+        self.write_memory(ansi_address, &ansi)?;
+        self.write_memory(utf16_address, &utf16)?;
+        *self.environment_block_ansi = ansi_address;
+        *self.environment_block_utf16 = utf16_address;
+        self.memory
+            .write_u32(
+                GuestAddress(self.process_parameters.0 + 0x48),
+                utf16_address.0,
+            )
+            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        Ok(())
+    }
+
     fn environment_block_ansi(&self) -> GuestAddress {
-        self.environment_block_ansi
+        *self.environment_block_ansi
     }
 
     fn environment_block_utf16(&self) -> GuestAddress {
-        self.environment_block_utf16
+        *self.environment_block_utf16
     }
 
     fn current_directory(&self) -> &str {

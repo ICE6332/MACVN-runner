@@ -18,7 +18,9 @@ const MEM_RESERVE: u32 = 0x0000_2000;
 const MEM_COMMIT_RESERVE: u32 = MEM_COMMIT | MEM_RESERVE;
 const MEM_RELEASE: u32 = 0x0000_8000;
 const GENERIC_READ: u32 = 0x8000_0000;
-const OPEN_EXISTING: u32 = 3;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
+const FILE_READ_DATA: u32 = 0x0000_0001;
 const INVALID_HANDLE_VALUE: u32 = u32::MAX;
 
 /// Register the current `kernel32.dll` surface.
@@ -27,7 +29,10 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "TerminateProcess"), TerminateProcess);
     registry.register(ApiKey::new(MODULE, "ResumeThread"), ResumeThread);
     registry.register(ApiKey::new(MODULE, "CreateThread"), CreateThread);
+    registry.register(ApiKey::new(MODULE, "CreateProcessA"), CreateProcess);
+    registry.register(ApiKey::new(MODULE, "CreateProcessW"), CreateProcess);
     registry.register(ApiKey::new(MODULE, "ExitThread"), ExitThread);
+    registry.register(ApiKey::new(MODULE, "Sleep"), Sleep);
     registry.register(ApiKey::new(MODULE, "GetTickCount"), GetTickCount);
     registry.register(ApiKey::new(MODULE, "GetStartupInfoA"), GetStartupInfo);
     registry.register(ApiKey::new(MODULE, "GetStartupInfoW"), GetStartupInfo);
@@ -67,7 +72,36 @@ pub fn register(registry: &mut ApiRegistry) {
         GetTimeZoneInformation,
     );
     registry.register(ApiKey::new(MODULE, "IsBadWritePtr"), IsBadWritePtr);
+    registry.register(ApiKey::new(MODULE, "IsBadCodePtr"), IsBadCodePtr);
+    registry.register(ApiKey::new(MODULE, "IsBadReadPtr"), IsBadReadPtr);
     registry.register(ApiKey::new(MODULE, "RtlUnwind"), RtlUnwind);
+    registry.register(ApiKey::new(MODULE, "RaiseException"), RaiseException);
+    registry.register(
+        ApiKey::new(MODULE, "CompareStringA"),
+        CompareString { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "CompareStringW"),
+        CompareString { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "lstrcmpiA"),
+        StringCompareInsensitive { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "lstrcmpiW"),
+        StringCompareInsensitive { wide: true },
+    );
+    registry.register(ApiKey::new(MODULE, "lstrcpyA"), StringCopy { wide: false });
+    registry.register(ApiKey::new(MODULE, "lstrcpyW"), StringCopy { wide: true });
+    registry.register(
+        ApiKey::new(MODULE, "SetEnvironmentVariableA"),
+        SetEnvironmentVariable { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "SetEnvironmentVariableW"),
+        SetEnvironmentVariable { wide: true },
+    );
     registry.register(ApiKey::new(MODULE, "IsValidLocale"), IsValidLocale);
     registry.register(ApiKey::new(MODULE, "IsValidCodePage"), IsValidCodePage);
     registry.register(
@@ -208,6 +242,7 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "LoadLibraryW"),
         LoadLibrary { wide: true },
     );
+    registry.register(ApiKey::new(MODULE, "FreeLibrary"), FreeLibrary);
     registry.register(ApiKey::new(MODULE, "EncodePointer"), PointerCodec);
     registry.register(ApiKey::new(MODULE, "DecodePointer"), PointerCodec);
     for (name, operation) in [
@@ -265,6 +300,7 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "GetStdHandle"), GetStdHandle);
     registry.register(ApiKey::new(MODULE, "SetStdHandle"), SetStdHandle);
     registry.register(ApiKey::new(MODULE, "FlushFileBuffers"), FlushFileBuffers);
+    registry.register(ApiKey::new(MODULE, "SetEndOfFile"), SetEndOfFile);
     registry.register(ApiKey::new(MODULE, "WriteFile"), WriteFile);
     registry.register(ApiKey::new(MODULE, "GetFileSize"), GetFileSize);
     registry.register(ApiKey::new(MODULE, "SetFilePointer"), SetFilePointer);
@@ -373,6 +409,14 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "GetFullPathNameW"),
         GetFullPathName { wide: true },
     );
+    registry.register(
+        ApiKey::new(MODULE, "GetSystemDirectoryA"),
+        GetSystemDirectory { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetSystemDirectoryW"),
+        GetSystemDirectory { wide: true },
+    );
     registry.register(ApiKey::new(MODULE, "GetFileTime"), GetFileTime);
     registry.register(
         ApiKey::new(MODULE, "GetFileAttributesA"),
@@ -390,6 +434,22 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(
         ApiKey::new(MODULE, "CreateDirectoryW"),
         CreateDirectory { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "RemoveDirectoryA"),
+        RemoveDirectory { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "RemoveDirectoryW"),
+        RemoveDirectory { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "DeleteFileA"),
+        DeleteFile { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "DeleteFileW"),
+        DeleteFile { wide: true },
     );
     registry.register(
         ApiKey::new(MODULE, "OutputDebugStringA"),
@@ -430,7 +490,22 @@ struct ResumeThread;
 struct CreateThread;
 
 #[derive(Debug, Clone, Copy)]
+struct CreateProcess;
+
+#[derive(Debug, Clone, Copy)]
 struct ExitThread;
+
+#[derive(Debug, Clone, Copy)]
+struct Sleep;
+
+impl HostCallHandler for Sleep {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let milliseconds = context.argument_u32(0)?;
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(milliseconds)));
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for ExitThread {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -450,6 +525,18 @@ impl HostCallHandler for CreateThread {
         context.set_last_error(50); // ERROR_NOT_SUPPORTED
         context.set_return_u32(0);
         context.set_stdcall_cleanup(24);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for CreateProcess {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        // Child-process creation needs a separate Guest address space, handle
+        // inheritance, and waitable process/thread objects. Keep export probes
+        // working while making an actual invocation fail deterministically.
+        context.set_last_error(50); // ERROR_NOT_SUPPORTED
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(40);
         Ok(())
     }
 }
@@ -655,7 +742,227 @@ struct GetTimeZoneInformation;
 struct IsBadWritePtr;
 
 #[derive(Debug, Clone, Copy)]
+struct IsBadCodePtr;
+
+#[derive(Debug, Clone, Copy)]
+struct IsBadReadPtr;
+
+impl HostCallHandler for IsBadReadPtr {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let size = context.argument_u32(1)?;
+        context.set_return_u32(u32::from(!context.is_memory_readable(address, size)));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for IsBadCodePtr {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        context.set_return_u32(u32::from(!context.is_memory_executable(address)));
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct RtlUnwind;
+
+#[derive(Debug, Clone, Copy)]
+struct RaiseException;
+
+#[derive(Debug, Clone, Copy)]
+struct CompareString {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StringCompareInsensitive {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StringCopy {
+    wide: bool,
+}
+
+impl HostCallHandler for StringCopy {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let destination = GuestAddress(context.argument_u32(0)?);
+        let source = GuestAddress(context.argument_u32(1)?);
+        let bytes = if self.wide {
+            read_guest_utf16_units(context, source, -1)?
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        } else {
+            let mut bytes = read_guest_z_bytes(context, source)?;
+            bytes.push(0);
+            bytes
+        };
+        context.write_memory(destination, &bytes)?;
+        context.set_return_u32(destination.0);
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for StringCompareInsensitive {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let left_address = GuestAddress(context.argument_u32(0)?);
+        let right_address = GuestAddress(context.argument_u32(1)?);
+        let (left, right) = if self.wide {
+            (
+                read_utf16_z(context, left_address)?,
+                read_utf16_z(context, right_address)?,
+            )
+        } else {
+            (
+                read_ansi_z(context, left_address)?,
+                read_ansi_z(context, right_address)?,
+            )
+        };
+        let result: i32 = match left.to_lowercase().cmp(&right.to_lowercase()) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        context.set_return_u32(result as u32);
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SetEnvironmentVariable {
+    wide: bool,
+}
+
+impl HostCallHandler for SetEnvironmentVariable {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let name_address = GuestAddress(context.argument_u32(0)?);
+        let value_address = GuestAddress(context.argument_u32(1)?);
+        let name = if self.wide {
+            read_utf16_z(context, name_address)?
+        } else {
+            read_ansi_z(context, name_address)?
+        };
+        let value = if value_address.0 == 0 {
+            None
+        } else if self.wide {
+            Some(read_utf16_z(context, value_address)?)
+        } else {
+            Some(read_ansi_z(context, value_address)?)
+        };
+        match context.set_environment_variable(&name, value.as_deref()) {
+            Ok(()) => {
+                context.set_last_error(0);
+                context.set_return_u32(1);
+            }
+            Err(_) => {
+                context.set_last_error(87); // ERROR_INVALID_PARAMETER
+                context.set_return_u32(0);
+            }
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for CompareString {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let _locale = context.argument_u32(0)?;
+        let flags = context.argument_u32(1)?;
+        if flags & !0x0000_1001 != 0 {
+            return Err(Win32Error::Unsupported {
+                feature: "CompareString normalization flags",
+            });
+        }
+        let left = read_compare_string(
+            context,
+            GuestAddress(context.argument_u32(2)?),
+            context.argument_u32(3)? as i32,
+            self.wide,
+        )?;
+        let right = read_compare_string(
+            context,
+            GuestAddress(context.argument_u32(4)?),
+            context.argument_u32(5)? as i32,
+            self.wide,
+        )?;
+        let (left, right) = if flags & 1 != 0 {
+            (left.to_lowercase(), right.to_lowercase())
+        } else {
+            (left, right)
+        };
+        let result = match left.cmp(&right) {
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Equal => 2,
+            std::cmp::Ordering::Greater => 3,
+        };
+        context.set_last_error(0);
+        context.set_return_u32(result);
+        context.set_stdcall_cleanup(24);
+        Ok(())
+    }
+}
+
+fn read_compare_string(
+    context: &dyn HostCallContext,
+    address: GuestAddress,
+    length: i32,
+    wide: bool,
+) -> Result<String, Win32Error> {
+    if wide {
+        return String::from_utf16(&read_guest_utf16_units(context, address, length)?)
+            .map_err(|_| Win32Error::InvalidArgument("CompareString UTF-16 input"));
+    }
+    let bytes = if length < 0 {
+        read_guest_z_bytes(context, address)?
+    } else if length > 0 {
+        read_guest_bytes(
+            context,
+            address,
+            usize::try_from(length)
+                .map_err(|_| Win32Error::InvalidArgument("CompareString ANSI length"))?,
+        )?
+    } else {
+        return Err(Win32Error::InvalidArgument("CompareString source length"));
+    };
+    Ok(SHIFT_JIS.decode_without_bom_handling(&bytes).0.into_owned())
+}
+
+impl HostCallHandler for RaiseException {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let code = context.argument_u32(0)?;
+        let flags = context.argument_u32(1)?;
+        let count = usize::try_from(context.argument_u32(2)?)
+            .map_err(|_| Win32Error::InvalidArgument("RaiseException parameter count"))?;
+        let source = GuestAddress(context.argument_u32(3)?);
+        if flags & !1 != 0 || count > 15 || (count != 0 && source.0 == 0) {
+            return Err(Win32Error::InvalidArgument("RaiseException arguments"));
+        }
+        let mut information = Vec::with_capacity(count);
+        for index in 0..count {
+            let offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .ok_or(Win32Error::InvalidArgument(
+                    "RaiseException parameter offset",
+                ))?;
+            let address = source.0.checked_add(offset).map(GuestAddress).ok_or(
+                Win32Error::InvalidArgument("RaiseException parameter address"),
+            )?;
+            let mut bytes = [0_u8; 4];
+            context.read_memory(address, &mut bytes)?;
+            information.push(u32::from_le_bytes(bytes));
+        }
+        context.raise_guest_exception(code, flags, &information)?;
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct IsValidLocale;
@@ -1851,6 +2158,9 @@ struct LoadLibrary {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct FreeLibrary;
+
+#[derive(Debug, Clone, Copy)]
 struct PointerCodec;
 
 #[derive(Debug, Clone, Copy)]
@@ -1932,6 +2242,24 @@ impl HostCallHandler for LoadLibrary {
             context.set_return_u32(handle.0);
         } else {
             debug!(name, "Guest DLL is not modeled");
+            context.set_last_error(126); // ERROR_MOD_NOT_FOUND
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for FreeLibrary {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let module = GuestAddress(context.argument_u32(0)?);
+        if context.loaded_module_name(module).is_some() {
+            // Modeled DLLs are process-lifetime facades backed by Host-call
+            // thunks. Unmapping one would invalidate already-resolved imports,
+            // so a balanced unload succeeds without destroying the facade.
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
             context.set_last_error(126); // ERROR_MOD_NOT_FOUND
             context.set_return_u32(0);
         }
@@ -2110,11 +2438,14 @@ impl HostCallHandler for CreateFile {
             read_ansi_z(context, path_address)?
         };
         let desired_access = context.argument_u32(1)?;
-        if desired_access & GENERIC_READ == 0 || desired_access & 0x4000_0000 != 0 {
+        if desired_access & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | FILE_READ_DATA) != 0
+        {
             return Err(Win32Error::Unsupported {
-                feature: "CreateFile access other than read-only",
+                feature: "CreateFile non-generic access flags",
             });
         }
+        let readable = desired_access & (GENERIC_READ | GENERIC_EXECUTE) != 0;
+        let writable = desired_access & GENERIC_WRITE != 0;
         let security = GuestAddress(context.argument_u32(3)?);
         if security.0 != 0 {
             let mut attributes = [0; 12];
@@ -2130,7 +2461,8 @@ impl HostCallHandler for CreateFile {
                 ));
             }
         }
-        if context.argument_u32(4)? != OPEN_EXISTING || context.argument_u32(6)? != 0 {
+        let disposition = context.argument_u32(4)?;
+        if !(1..=5).contains(&disposition) || context.argument_u32(6)? != 0 {
             return Err(Win32Error::Unsupported {
                 feature: "CreateFile creation or template mode",
             });
@@ -2142,15 +2474,19 @@ impl HostCallHandler for CreateFile {
                 feature: "CreateFile flags",
             });
         }
-        match context.open_file_read(&path) {
-            Ok(handle) => {
+        match context.open_file(&path, readable, writable, disposition) {
+            Ok((handle, existed)) => {
                 debug!(path, handle = handle.0, "opened Guest file");
-                context.set_last_error(0);
+                context.set_last_error(if existed && matches!(disposition, 2 | 4) {
+                    183 // ERROR_ALREADY_EXISTS
+                } else {
+                    0
+                });
                 context.set_return_u32(handle.0);
             }
             Err(_) => {
                 debug!(path, "Guest file was not found");
-                context.set_last_error(2); // ERROR_FILE_NOT_FOUND
+                context.set_last_error(if disposition == 1 { 80 } else { 2 });
                 context.set_return_u32(INVALID_HANDLE_VALUE);
             }
         }
@@ -2396,7 +2732,25 @@ struct FlushFileBuffers;
 impl HostCallHandler for FlushFileBuffers {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let handle = Handle(context.argument_u32(0)?);
-        if context.file_type(handle).is_some() {
+        if context.flush_file(handle).is_ok() {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SetEndOfFile;
+
+impl HostCallHandler for SetEndOfFile {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let handle = Handle(context.argument_u32(0)?);
+        if context.set_end_of_file(handle).is_ok() {
             context.set_last_error(0);
             context.set_return_u32(1);
         } else {
@@ -2849,6 +3203,35 @@ struct GetFullPathName {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct GetSystemDirectory {
+    wide: bool,
+}
+
+impl HostCallHandler for GetSystemDirectory {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        const PATH: &str = r"C:\Windows\System32";
+        let output = GuestAddress(context.argument_u32(0)?);
+        let capacity = context.argument_u32(1)?;
+        let encoded = if self.wide {
+            encode_utf16_z(PATH)
+        } else {
+            encode_ansi_z(PATH)
+        };
+        let stride = if self.wide { 2 } else { 1 };
+        let required = u32::try_from(encoded.len() / stride)
+            .map_err(|_| Win32Error::InvalidArgument("system directory length"))?;
+        if capacity < required || output.0 == 0 {
+            context.set_return_u32(required);
+        } else {
+            context.write_memory(output, &encoded)?;
+            context.set_return_u32(required - 1);
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct GetFileTime;
 
 #[derive(Debug, Clone, Copy)]
@@ -2862,6 +3245,56 @@ struct SetErrorMode;
 #[derive(Debug, Clone, Copy)]
 struct CreateDirectory {
     wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoveDirectory {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeleteFile {
+    wide: bool,
+}
+
+impl HostCallHandler for DeleteFile {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, address)?
+        } else {
+            read_ansi_z(context, address)?
+        };
+        if context.remove_file(&path).is_ok() {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for RemoveDirectory {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, address)?
+        } else {
+            read_ansi_z(context, address)?
+        };
+        if context.remove_directory(&path).is_ok() {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(3); // ERROR_PATH_NOT_FOUND
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
 }
 
 impl HostCallHandler for GetFileAttributes {
@@ -3662,11 +4095,15 @@ mod tests {
             "TerminateProcess",
             "ResumeThread",
             "CreateThread",
+            "CreateProcessA",
+            "CreateProcessW",
+            "Sleep",
             "ExitThread",
             "SetUnhandledExceptionFilter",
             "UnhandledExceptionFilter",
             "LoadLibraryA",
             "LoadLibraryW",
+            "FreeLibrary",
             "EncodePointer",
             "DecodePointer",
             "InitializeCriticalSectionAndSpinCount",

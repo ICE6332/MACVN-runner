@@ -21,6 +21,7 @@ const CONTEXT_ESP: u32 = 196;
 
 pub(super) struct PendingException {
     code: u32,
+    flags: u32,
     address: GuestAddress,
     record: GuestAddress,
     context: GuestAddress,
@@ -41,6 +42,26 @@ impl Runtime {
         let (code, address) = match exception {
             CpuException::Breakpoint { address, .. } => (EXCEPTION_BREAKPOINT, address),
         };
+        self.dispatch_guest_exception(code, 0, address, &[])
+    }
+
+    pub(super) fn dispatch_guest_exception(
+        &mut self,
+        code: u32,
+        flags: u32,
+        address: GuestAddress,
+        information: &[u32],
+    ) -> Result<(), RuntimeError> {
+        if self.pending_exception.is_some() {
+            return Err(RuntimeError::Unsupported(
+                "nested Guest exception during SEH dispatch",
+            ));
+        }
+        if information.len() > 15 {
+            return Err(RuntimeError::Unsupported(
+                "Guest exception parameter limit exceeded",
+            ));
+        }
         let fault_stack_words = (0..9_u32)
             .map_while(|index| {
                 self.cpu
@@ -86,10 +107,11 @@ impl Runtime {
                 .checked_sub(EXCEPTION_RECORD_SIZE)
                 .ok_or(RuntimeError::Unsupported("SEH record stack overflow"))?,
         );
-        self.write_exception_record(record, code, address)?;
+        self.write_exception_record(record, code, flags, address, information)?;
         self.write_x86_context(context)?;
         self.pending_exception = Some(PendingException {
             code,
+            flags,
             address,
             record,
             context,
@@ -103,6 +125,15 @@ impl Runtime {
         let disposition = self.cpu.state.registers.eax;
         match disposition {
             0 => {
+                if self
+                    .pending_exception
+                    .as_ref()
+                    .is_some_and(|pending| pending.flags & 1 != 0)
+                {
+                    return Err(RuntimeError::Unsupported(
+                        "continued a noncontinuable Guest exception",
+                    ));
+                }
                 let context = self
                     .pending_exception
                     .as_ref()
@@ -182,13 +213,32 @@ impl Runtime {
         &mut self,
         record: GuestAddress,
         code: u32,
+        flags: u32,
         address: GuestAddress,
+        information: &[u32],
     ) -> Result<(), RuntimeError> {
         self.memory
             .write(record, &vec![0; EXCEPTION_RECORD_SIZE as usize])?;
         self.memory.write_u32(record, code)?;
+        self.memory.write_u32(GuestAddress(record.0 + 4), flags)?;
         self.memory
             .write_u32(GuestAddress(record.0 + 12), address.0)?;
+        self.memory.write_u32(
+            GuestAddress(record.0 + 16),
+            u32::try_from(information.len())
+                .map_err(|_| RuntimeError::Unsupported("exception parameter count overflow"))?,
+        )?;
+        for (index, value) in information.iter().enumerate() {
+            let offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .and_then(|offset| offset.checked_add(20))
+                .ok_or(RuntimeError::Unsupported(
+                    "exception parameter offset overflow",
+                ))?;
+            self.memory
+                .write_u32(GuestAddress(record.0 + offset), *value)?;
+        }
         Ok(())
     }
 
