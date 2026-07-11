@@ -11,7 +11,13 @@ VNRT keeps `iced-x86` as its decoder. The evaluated replacements either require 
 - Self-modifying code is covered by a regression test.
 - Runtime batches consecutive CPU steps when instruction-level tracing is disabled.
 - Decoded basic blocks execute up to 64 straight-line instructions after one page-generation validation.
+- A process-wide executable epoch makes per-instruction block validation a
+  scalar comparison. Full page-generation validation runs only after an
+  executable mapping, protection change, unmap, or write; ordinary archive
+  output writes do not invalidate code.
 - Single-page `u8`, `u16`, and `u32` accesses bypass the generic cross-page walker.
+- Release builds use thin LTO with one codegen unit so the interpreter's
+  cross-crate memory fast paths can inline.
 
 On the local Chinese-launcher checkpoint, 20 million interpreted steps fell from roughly 3.0 seconds of CPU time to roughly 1.0 second. The 350-million-step target run reaches the same NTDLL-resolution boundary in roughly 9 seconds of CPU time; observed wall time varies with host scheduling.
 
@@ -33,3 +39,9 @@ limit while indexing/decrypting the real YPF archives. Profile this loop before
 choosing between wider safe block execution, a compact translated-block IR, or
 a narrowly scoped direct-pointer path. A JIT remains a later option rather than
 the default next step.
+
+On the current Apple M2 Pro checkpoint, adding thin LTO reduced the same
+one-billion-instruction target run from 66.45 to 59.87 seconds wall time. A
+five-second sample after the executable-epoch change reduced
+`block_is_valid` top-of-stack samples from 246 to 7; the next dominant safe
+targets are operand dispatch and repeated read-only archive opens.

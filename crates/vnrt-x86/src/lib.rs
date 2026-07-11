@@ -593,6 +593,7 @@ impl Interpreter {
                     }
                 }
             };
+            let mut executable_epoch = memory.executable_epoch();
             for instruction in &block.instructions {
                 if steps >= max_steps || instruction.ip32() != self.state.registers.eip {
                     break;
@@ -627,8 +628,12 @@ impl Interpreter {
                     return Err(error);
                 }
                 steps += 1;
-                if !block_is_valid(memory, &block)? {
-                    break;
+                let current_executable_epoch = memory.executable_epoch();
+                if current_executable_epoch != executable_epoch {
+                    if !block_is_valid(memory, &block)? {
+                        break;
+                    }
+                    executable_epoch = current_executable_epoch;
                 }
             }
         }

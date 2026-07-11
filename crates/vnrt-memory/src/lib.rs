@@ -152,6 +152,7 @@ impl Page {
 pub struct GuestMemory {
     page_directory: Box<[Option<PageTable>]>,
     next_generation: u64,
+    executable_epoch: u64,
     track_executable_writes: bool,
     tracked_write_range: Option<(u32, u32)>,
     write_origin: Option<GuestAddress>,
@@ -171,6 +172,7 @@ impl GuestMemory {
         Self {
             page_directory: empty_slots(),
             next_generation: 1,
+            executable_epoch: 1,
             track_executable_writes: false,
             tracked_write_range: None,
             write_origin: None,
@@ -201,6 +203,9 @@ impl GuestMemory {
             let table = self.page_directory[directory_index].get_or_insert_with(empty_slots);
             table[table_index] = Some(Page::zeroed(permissions, generation));
         }
+        if permissions.execute {
+            self.bump_executable_epoch();
+        }
         Ok(())
     }
 
@@ -217,12 +222,22 @@ impl GuestMemory {
             .checked_add(len)
             .ok_or(MemoryError::AddressOverflow)?;
         for address in (start.0..end).step_by(PAGE_SIZE) {
+            if self.page(GuestAddress(address)).is_none() {
+                return Err(MemoryError::NotMapped { address });
+            }
+        }
+        let mut executable_changed = permissions.execute;
+        for address in (start.0..end).step_by(PAGE_SIZE) {
             let generation = self.fresh_generation();
             let page = self
                 .page_mut(GuestAddress(address))
-                .ok_or(MemoryError::NotMapped { address })?;
+                .expect("protection range was validated above");
+            executable_changed |= page.permissions.execute;
             page.permissions = permissions;
             page.generation = generation;
+        }
+        if executable_changed {
+            self.bump_executable_epoch();
         }
         Ok(())
     }
@@ -243,6 +258,10 @@ impl GuestMemory {
             .0
             .checked_add(len)
             .ok_or(MemoryError::AddressOverflow)?;
+        let executable_changed = (start.0..end).step_by(PAGE_SIZE).any(|address| {
+            self.page(GuestAddress(address))
+                .is_some_and(|page| page.permissions.execute)
+        });
         for address in (start.0..end).step_by(PAGE_SIZE) {
             if self.page(GuestAddress(address)).is_none() {
                 return Err(MemoryError::NotMapped { address });
@@ -253,6 +272,9 @@ impl GuestMemory {
             self.page_directory[directory_index]
                 .as_mut()
                 .expect("page table was validated above")[table_index] = None;
+        }
+        if executable_changed {
+            self.bump_executable_epoch();
         }
         Ok(())
     }
@@ -293,6 +315,12 @@ impl GuestMemory {
         Ok(page.generation)
     }
 
+    /// Process-wide epoch changed only by executable mappings or writes.
+    #[must_use]
+    pub fn executable_epoch(&self) -> u64 {
+        self.executable_epoch
+    }
+
     /// Write bytes, transparently crossing page boundaries.
     pub fn write(&mut self, address: GuestAddress, input: &[u8]) -> Result<(), MemoryError> {
         walk_chunks(address, input.len(), |guest, source_offset, chunk_len| {
@@ -313,6 +341,9 @@ impl GuestMemory {
             page.bytes[page_offset..page_offset + chunk_len]
                 .copy_from_slice(&input[source_offset..source_offset + chunk_len]);
             page.generation = generation;
+            if executable {
+                self.bump_executable_epoch();
+            }
             if (self.track_executable_writes && executable)
                 || self.write_is_in_tracked_range(guest, chunk_len)
             {
@@ -488,6 +519,9 @@ impl GuestMemory {
         let offset = address.page_offset();
         page.bytes[offset..offset + input.len()].copy_from_slice(input);
         page.generation = generation;
+        if executable {
+            self.bump_executable_epoch();
+        }
         if (self.track_executable_writes && executable)
             || self.write_is_in_tracked_range(address, input.len())
         {
@@ -523,6 +557,10 @@ impl GuestMemory {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         generation
+    }
+
+    fn bump_executable_epoch(&mut self) {
+        self.executable_epoch = self.executable_epoch.wrapping_add(1).max(1);
     }
 }
 
@@ -662,5 +700,23 @@ mod tests {
             memory.executable_page_generation(address).unwrap(),
             reprotected
         );
+    }
+
+    #[test]
+    fn executable_epoch_ignores_data_writes_and_tracks_code_changes() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_range(GuestAddress(0x1000), PAGE_SIZE_U32, Permissions::ALL)
+            .unwrap();
+        memory
+            .map_range(GuestAddress(0x2000), PAGE_SIZE_U32, Permissions::READ_WRITE)
+            .unwrap();
+        let mapped_epoch = memory.executable_epoch();
+
+        memory.write_u32(GuestAddress(0x2000), 1).unwrap();
+        assert_eq!(memory.executable_epoch(), mapped_epoch);
+
+        memory.write_u32(GuestAddress(0x1000), 1).unwrap();
+        assert_ne!(memory.executable_epoch(), mapped_epoch);
     }
 }
