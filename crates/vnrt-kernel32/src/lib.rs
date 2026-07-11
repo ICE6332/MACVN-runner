@@ -10,9 +10,12 @@ use vnrt_win32::{
 
 const MODULE: &str = "kernel32.dll";
 const HEAP_NO_SERIALIZE: u32 = 0x0000_0001;
+const HEAP_GENERATE_EXCEPTIONS: u32 = 0x0000_0004;
 const HEAP_CREATE_ENABLE_EXECUTE: u32 = 0x0004_0000;
 const HEAP_ZERO_MEMORY: u32 = 0x0000_0008;
-const MEM_COMMIT_RESERVE: u32 = 0x0000_3000;
+const MEM_COMMIT: u32 = 0x0000_1000;
+const MEM_RESERVE: u32 = 0x0000_2000;
+const MEM_COMMIT_RESERVE: u32 = MEM_COMMIT | MEM_RESERVE;
 const MEM_RELEASE: u32 = 0x0000_8000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const OPEN_EXISTING: u32 = 3;
@@ -56,10 +59,18 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "GlobalLock"), GlobalLock);
     registry.register(ApiKey::new(MODULE, "GlobalUnlock"), GlobalUnlock);
     registry.register(ApiKey::new(MODULE, "GlobalFree"), GlobalFree);
+    registry.register(ApiKey::new(MODULE, "LocalAlloc"), LocalAlloc);
+    registry.register(ApiKey::new(MODULE, "LocalFree"), LocalFree);
     registry.register(
         ApiKey::new(MODULE, "InitializeCriticalSection"),
         CriticalSection {
             operation: CriticalSectionOperation::Initialize,
+        },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "InitializeCriticalSectionAndSpinCount"),
+        CriticalSection {
+            operation: CriticalSectionOperation::InitializeAndSpinCount,
         },
     );
     registry.register(
@@ -157,6 +168,20 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "LoadLibraryW"),
         LoadLibrary { wide: true },
     );
+    registry.register(ApiKey::new(MODULE, "EncodePointer"), PointerCodec);
+    registry.register(ApiKey::new(MODULE, "DecodePointer"), PointerCodec);
+    for (name, operation) in [
+        ("InterlockedIncrement", InterlockedOperation::Increment),
+        ("InterlockedDecrement", InterlockedOperation::Decrement),
+        ("InterlockedExchange", InterlockedOperation::Exchange),
+        (
+            "InterlockedCompareExchange",
+            InterlockedOperation::CompareExchange,
+        ),
+        ("InterlockedExchangeAdd", InterlockedOperation::ExchangeAdd),
+    ] {
+        registry.register(ApiKey::new(MODULE, name), Interlocked { operation });
+    }
     registry.register(ApiKey::new(MODULE, "GetProcAddress"), GetProcAddress);
     registry.register(
         ApiKey::new(MODULE, "GetCommandLineA"),
@@ -178,6 +203,7 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "SetLastError"), SetLastError);
     registry.register(ApiKey::new(MODULE, "VirtualAlloc"), VirtualAlloc);
     registry.register(ApiKey::new(MODULE, "VirtualFree"), VirtualFree);
+    registry.register(ApiKey::new(MODULE, "VirtualProtect"), VirtualProtect);
     registry.register(
         ApiKey::new(MODULE, "CreateFileA"),
         CreateFile { wide: false },
@@ -244,6 +270,51 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(
         ApiKey::new(MODULE, "GetCurrentThreadId"),
         CurrentId { thread: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetCurrentProcess"),
+        CurrentPseudoHandle { thread: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetCurrentThread"),
+        CurrentPseudoHandle { thread: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetThreadPreferredUILanguages"),
+        GetThreadPreferredUiLanguages,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetFullPathNameA"),
+        GetFullPathName { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetFullPathNameW"),
+        GetFullPathName { wide: true },
+    );
+    registry.register(ApiKey::new(MODULE, "GetFileTime"), GetFileTime);
+    registry.register(
+        ApiKey::new(MODULE, "OutputDebugStringA"),
+        OutputDebugString { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "OutputDebugStringW"),
+        OutputDebugString { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetShortPathNameA"),
+        GetShortPathName { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetShortPathNameW"),
+        GetShortPathName { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetLongPathNameA"),
+        GetShortPathName { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetLongPathNameW"),
+        GetShortPathName { wide: true },
     );
 }
 
@@ -469,9 +540,9 @@ impl HostCallHandler for HeapAlloc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let heap = Handle(context.argument_u32(0)?);
         let flags = context.argument_u32(1)?;
-        if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0 {
+        if flags & !(HEAP_NO_SERIALIZE | HEAP_GENERATE_EXCEPTIONS | HEAP_ZERO_MEMORY) != 0 {
             return Err(Win32Error::Unsupported {
-                feature: "kernel32!HeapAlloc flags other than HEAP_ZERO_MEMORY",
+                feature: "kernel32!HeapAlloc flags",
             });
         }
         let size = context.argument_u32(2)?;
@@ -489,9 +560,9 @@ impl HostCallHandler for HeapReAlloc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let heap = Handle(context.argument_u32(0)?);
         let flags = context.argument_u32(1)?;
-        if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0 {
+        if flags & !(HEAP_NO_SERIALIZE | HEAP_GENERATE_EXCEPTIONS | HEAP_ZERO_MEMORY) != 0 {
             return Err(Win32Error::Unsupported {
-                feature: "kernel32!HeapReAlloc flags other than HEAP_ZERO_MEMORY",
+                feature: "kernel32!HeapReAlloc flags",
             });
         }
         let address = GuestAddress(context.argument_u32(2)?);
@@ -601,6 +672,46 @@ impl HostCallHandler for GlobalUnlock {
 #[derive(Debug, Clone, Copy)]
 struct GlobalFree;
 
+#[derive(Debug, Clone, Copy)]
+struct LocalAlloc;
+
+#[derive(Debug, Clone, Copy)]
+struct LocalFree;
+
+impl HostCallHandler for LocalAlloc {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let flags = context.argument_u32(0)?;
+        if flags & !0x0040 != 0 {
+            return Err(Win32Error::Unsupported {
+                feature: "LocalAlloc movable or unsupported flags",
+            });
+        }
+        let address =
+            context.allocate_heap_memory(Handle(PROCESS_HEAP_HANDLE), context.argument_u32(1)?)?;
+        context.set_return_u32(address.0);
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for LocalFree {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        if address.0 == 0
+            || context
+                .free_heap_memory(Handle(PROCESS_HEAP_HANDLE), address)
+                .is_ok()
+        {
+            context.set_return_u32(0);
+        } else {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(address.0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
 impl HostCallHandler for GlobalFree {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let handle = Handle(context.argument_u32(0)?);
@@ -619,6 +730,7 @@ impl HostCallHandler for GlobalFree {
 #[derive(Debug, Clone, Copy)]
 enum CriticalSectionOperation {
     Initialize,
+    InitializeAndSpinCount,
     Delete,
     Enter,
     Leave,
@@ -1201,9 +1313,17 @@ impl HostCallHandler for CriticalSection {
         let address = GuestAddress(context.argument_u32(0)?);
         let mut bytes = [0; STRUCTURE_SIZE];
         match self.operation {
-            CriticalSectionOperation::Initialize => {
+            CriticalSectionOperation::Initialize
+            | CriticalSectionOperation::InitializeAndSpinCount => {
                 put_u32(&mut bytes, LOCK_COUNT_OFFSET, u32::MAX)?;
                 context.write_memory(address, &bytes)?;
+                if matches!(
+                    self.operation,
+                    CriticalSectionOperation::InitializeAndSpinCount
+                ) {
+                    let _spin_count = context.argument_u32(1)?;
+                    context.set_return_u32(1);
+                }
             }
             CriticalSectionOperation::Delete => {
                 context.read_memory(address, &mut bytes)?;
@@ -1256,7 +1376,16 @@ impl HostCallHandler for CriticalSection {
                 context.write_memory(address, &bytes)?;
             }
         }
-        context.set_stdcall_cleanup(4);
+        context.set_stdcall_cleanup(
+            if matches!(
+                self.operation,
+                CriticalSectionOperation::InitializeAndSpinCount
+            ) {
+                8
+            } else {
+                4
+            },
+        );
         Ok(())
     }
 }
@@ -1269,19 +1398,26 @@ struct GetModuleHandle {
 impl HostCallHandler for GetModuleHandle {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let name_address = GuestAddress(context.argument_u32(0)?);
-        let handle = if name_address.0 == 0 {
-            context.main_module_base()
+        if name_address.0 == 0 {
+            context.set_last_error(0);
+            context.set_return_u32(context.main_module_base().0);
         } else {
             let name = if self.wide {
                 read_utf16_z(context, name_address)?
             } else {
                 read_ansi_z(context, name_address)?
             };
-            context
-                .loaded_module_handle(&name)
-                .ok_or(Win32Error::ModuleNotFound(name))?
-        };
-        context.set_return_u32(handle.0);
+            if let Some(handle) = context.loaded_module_handle(&name) {
+                context.set_last_error(0);
+                context.set_return_u32(handle.0);
+            } else {
+                // Win32 reports a missing module through the return value and
+                // thread-local last error; it is not an exceptional Host-call
+                // failure and callers commonly probe optional DLLs this way.
+                context.set_last_error(126); // ERROR_MOD_NOT_FOUND
+                context.set_return_u32(0);
+            }
+        }
         context.set_stdcall_cleanup(4);
         Ok(())
     }
@@ -1293,6 +1429,68 @@ struct GetProcAddress;
 #[derive(Debug, Clone, Copy)]
 struct LoadLibrary {
     wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointerCodec;
+
+#[derive(Debug, Clone, Copy)]
+enum InterlockedOperation {
+    Increment,
+    Decrement,
+    Exchange,
+    CompareExchange,
+    ExchangeAdd,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Interlocked {
+    operation: InterlockedOperation,
+}
+
+impl HostCallHandler for PointerCodec {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        // A stable per-runtime cookie is sufficient for the observable Win32
+        // contract here: encoded pointers are opaque and DecodePointer must
+        // invert EncodePointer. XOR also maps null to a non-null token, as the
+        // native API does.
+        const POINTER_COOKIE: u32 = 0xA5C3_1F27;
+        context.set_return_u32(context.argument_u32(0)? ^ POINTER_COOKIE);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for Interlocked {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let target = GuestAddress(context.argument_u32(0)?);
+        let old = read_context_u32(context, target)?;
+        let (new, result, cleanup) = match self.operation {
+            InterlockedOperation::Increment => {
+                let new = old.wrapping_add(1);
+                (Some(new), new, 4)
+            }
+            InterlockedOperation::Decrement => {
+                let new = old.wrapping_sub(1);
+                (Some(new), new, 4)
+            }
+            InterlockedOperation::Exchange => (Some(context.argument_u32(1)?), old, 8),
+            InterlockedOperation::CompareExchange => {
+                let exchange = context.argument_u32(1)?;
+                let comparand = context.argument_u32(2)?;
+                ((old == comparand).then_some(exchange), old, 12)
+            }
+            InterlockedOperation::ExchangeAdd => {
+                (Some(old.wrapping_add(context.argument_u32(1)?)), old, 8)
+            }
+        };
+        if let Some(new) = new {
+            context.write_memory(target, &new.to_le_bytes())?;
+        }
+        context.set_return_u32(result);
+        context.set_stdcall_cleanup(cleanup);
+        Ok(())
+    }
 }
 
 impl HostCallHandler for LoadLibrary {
@@ -1487,6 +1685,11 @@ struct CreateFile {
 impl HostCallHandler for CreateFile {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let path_address = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, path_address)?
+        } else {
+            read_ansi_z(context, path_address)?
+        };
         let desired_access = context.argument_u32(1)?;
         if desired_access & GENERIC_READ == 0 || desired_access & 0x4000_0000 != 0 {
             return Err(Win32Error::Unsupported {
@@ -1513,16 +1716,13 @@ impl HostCallHandler for CreateFile {
                 feature: "CreateFile creation or template mode",
             });
         }
-        if context.argument_u32(5)? & !0x0000_0080 != 0 {
+        let flags = context.argument_u32(5)?;
+        debug!(path, desired_access, flags, "Guest file open request");
+        if flags & !(0x0000_0080 | 0x0200_0000) != 0 {
             return Err(Win32Error::Unsupported {
-                feature: "CreateFile flags other than FILE_ATTRIBUTE_NORMAL",
+                feature: "CreateFile flags",
             });
         }
-        let path = if self.wide {
-            read_utf16_z(context, path_address)?
-        } else {
-            read_ansi_z(context, path_address)?
-        };
         match context.open_file_read(&path) {
             Ok(handle) => {
                 debug!(path, handle = handle.0, "opened Guest file");
@@ -2061,6 +2261,32 @@ struct CurrentId {
     thread: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CurrentPseudoHandle {
+    thread: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GetThreadPreferredUiLanguages;
+
+#[derive(Debug, Clone, Copy)]
+struct GetFullPathName {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GetFileTime;
+
+#[derive(Debug, Clone, Copy)]
+struct OutputDebugString {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GetShortPathName {
+    wide: bool,
+}
+
 impl HostCallHandler for CurrentId {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let value = if self.thread {
@@ -2074,27 +2300,265 @@ impl HostCallHandler for CurrentId {
     }
 }
 
+impl HostCallHandler for CurrentPseudoHandle {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_return_u32(if self.thread { u32::MAX - 1 } else { u32::MAX });
+        context.set_stdcall_cleanup(0);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetThreadPreferredUiLanguages {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let language = match context.argument_u32(0)? {
+            0x0000_0004 => "0804",  // MUI_LANGUAGE_ID
+            0x0000_0008 => "zh-CN", // MUI_LANGUAGE_NAME
+            _ => {
+                return Err(Win32Error::Unsupported {
+                    feature: "GetThreadPreferredUILanguages flags",
+                });
+            }
+        };
+        let mut languages = encode_utf16_z(language);
+        languages.extend_from_slice(&[0, 0]);
+        let required_units =
+            u32::try_from(languages.len() / 2).map_err(|_| Win32Error::OutOfMemory)?;
+        let count_output = GuestAddress(context.argument_u32(1)?);
+        let buffer = GuestAddress(context.argument_u32(2)?);
+        let size_pointer = GuestAddress(context.argument_u32(3)?);
+        let supplied_units = read_context_u32(context, size_pointer)?;
+        context.write_memory(count_output, &1_u32.to_le_bytes())?;
+        context.write_memory(size_pointer, &required_units.to_le_bytes())?;
+        if buffer.0 == 0 && supplied_units == 0 {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else if supplied_units < required_units {
+            context.set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            context.set_return_u32(0);
+        } else {
+            context.write_memory(buffer, &languages)?;
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        }
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetFullPathName {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let source = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, source)?
+        } else {
+            read_ansi_z(context, source)?
+        };
+        let absolute = absolute_windows_path(context.current_directory(), &path)?;
+        let buffer_units = context.argument_u32(1)?;
+        let buffer = GuestAddress(context.argument_u32(2)?);
+        let file_part_output = GuestAddress(context.argument_u32(3)?);
+        let (encoded, length_without_nul, file_part_offset) = if self.wide {
+            let encoded = encode_utf16_z(&absolute);
+            let length =
+                u32::try_from(encoded.len() / 2 - 1).map_err(|_| Win32Error::OutOfMemory)?;
+            let file_part = absolute
+                .rfind('\\')
+                .map_or(0, |index| absolute[..=index].encode_utf16().count());
+            (
+                encoded,
+                length,
+                u32::try_from(file_part).map_err(|_| Win32Error::OutOfMemory)?,
+            )
+        } else {
+            let encoded = encode_ansi_z(&absolute);
+            let length = u32::try_from(encoded.len() - 1).map_err(|_| Win32Error::OutOfMemory)?;
+            let file_part = encoded[..encoded.len() - 1]
+                .iter()
+                .rposition(|byte| *byte == b'\\')
+                .map_or(0, |index| index + 1);
+            (
+                encoded,
+                length,
+                u32::try_from(file_part).map_err(|_| Win32Error::OutOfMemory)?,
+            )
+        };
+        let required_units = length_without_nul
+            .checked_add(1)
+            .ok_or(Win32Error::OutOfMemory)?;
+        if buffer_units < required_units {
+            context.set_return_u32(required_units);
+        } else {
+            context.write_memory(buffer, &encoded)?;
+            if file_part_output.0 != 0 {
+                let stride = if self.wide { 2 } else { 1 };
+                let file_part = buffer
+                    .0
+                    .checked_add(
+                        file_part_offset
+                            .checked_mul(stride)
+                            .ok_or(Win32Error::OutOfMemory)?,
+                    )
+                    .ok_or(Win32Error::OutOfMemory)?;
+                context.write_memory(file_part_output, &file_part.to_le_bytes())?;
+            }
+            context.set_return_u32(length_without_nul);
+        }
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetFileTime {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let handle = Handle(context.argument_u32(0)?);
+        if context.file_size(handle).is_err() {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(0);
+            context.set_stdcall_cleanup(16);
+            return Ok(());
+        }
+        let time = context.system_time_filetime().to_le_bytes();
+        for index in 1..=3 {
+            let output = GuestAddress(context.argument_u32(index)?);
+            if output.0 != 0 {
+                context.write_memory(output, &time)?;
+            }
+        }
+        context.set_last_error(0);
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for OutputDebugString {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let message = if self.wide {
+            read_utf16_z(context, address)?
+        } else {
+            read_ansi_z(context, address)?
+        };
+        debug!(message, "Guest debug string");
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetShortPathName {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let source = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, source)?
+        } else {
+            read_ansi_z(context, source)?
+        };
+        // The sandbox does not assign DOS 8.3 aliases. Windows permits volumes
+        // with short-name generation disabled, so preserve the canonical path.
+        let encoded = if self.wide {
+            encode_utf16_z(&path)
+        } else {
+            encode_ansi_z(&path)
+        };
+        let stride = if self.wide { 2 } else { 1 };
+        let required_units =
+            u32::try_from(encoded.len() / stride).map_err(|_| Win32Error::OutOfMemory)?;
+        let output = GuestAddress(context.argument_u32(1)?);
+        let supplied_units = context.argument_u32(2)?;
+        if output.0 == 0 || supplied_units < required_units {
+            context.set_return_u32(required_units);
+        } else {
+            context.write_memory(output, &encoded)?;
+            context.set_return_u32(required_units - 1);
+        }
+        context.set_stdcall_cleanup(12);
+        Ok(())
+    }
+}
+
+fn absolute_windows_path(current_directory: &str, path: &str) -> Result<String, Win32Error> {
+    let path = path.replace('/', "\\");
+    let current = current_directory.replace('/', "\\");
+    let current_drive = current
+        .get(..2)
+        .filter(|prefix| prefix.ends_with(':'))
+        .unwrap_or("C:");
+    let (drive, tail) = if path.as_bytes().get(1) == Some(&b':') {
+        (&path[..2], &path[2..])
+    } else if path.starts_with('\\') {
+        (current_drive, path.as_str())
+    } else {
+        let combined = format!("{}\\{}", current.trim_end_matches('\\'), path);
+        return absolute_windows_path(current_drive, &combined);
+    };
+    let mut components = Vec::new();
+    for component in tail.split('\\') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            value => components.push(value),
+        }
+    }
+    Ok(format!("{drive}\\{}", components.join("\\")))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VirtualAlloc;
 
+#[derive(Debug, Clone, Copy)]
+struct VirtualProtect;
+
+impl HostCallHandler for VirtualProtect {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let size = context.argument_u32(1)?;
+        let (read, write, execute) = virtual_protection(context.argument_u32(2)?)?;
+        let old = context.protect_virtual_memory(address, size, read, write, execute)?;
+        let old_protection = protection_flags(old)?;
+        context.write_memory(
+            GuestAddress(context.argument_u32(3)?),
+            &old_protection.to_le_bytes(),
+        )?;
+        context.set_last_error(0);
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
 impl HostCallHandler for VirtualAlloc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        if context.argument_u32(0)? != 0 {
-            return Err(Win32Error::Unsupported {
-                feature: "VirtualAlloc with a requested base address",
-            });
-        }
+        let requested_base = GuestAddress(context.argument_u32(0)?);
         let size = context.argument_u32(1)?;
         if size == 0 {
             return Err(Win32Error::InvalidArgument("VirtualAlloc zero size"));
         }
-        if context.argument_u32(2)? != MEM_COMMIT_RESERVE {
-            return Err(Win32Error::Unsupported {
-                feature: "VirtualAlloc allocation type other than MEM_RESERVE|MEM_COMMIT",
-            });
-        }
         let (read, write, execute) = virtual_protection(context.argument_u32(3)?)?;
-        let address = context.allocate_virtual_memory(size, read, write, execute)?;
+        let address = match context.argument_u32(2)? {
+            MEM_RESERVE if requested_base.0 == 0 => context.reserve_virtual_memory(size)?,
+            MEM_COMMIT if requested_base.0 != 0 => {
+                context.commit_virtual_memory(requested_base, size, read, write, execute)?;
+                requested_base
+            }
+            MEM_COMMIT if requested_base.0 == 0 => {
+                context.allocate_virtual_memory(size, read, write, execute)?
+            }
+            MEM_COMMIT_RESERVE if requested_base.0 == 0 => {
+                context.allocate_virtual_memory(size, read, write, execute)?
+            }
+            MEM_RESERVE | MEM_COMMIT | MEM_COMMIT_RESERVE => {
+                return Err(Win32Error::Unsupported {
+                    feature: "VirtualAlloc base/allocation-type combination",
+                });
+            }
+            _ => {
+                return Err(Win32Error::Unsupported {
+                    feature: "VirtualAlloc allocation type",
+                });
+            }
+        };
         context.set_return_u32(address.0);
         context.set_stdcall_cleanup(16);
         Ok(())
@@ -2129,6 +2593,20 @@ fn virtual_protection(protection: u32) -> Result<(bool, bool, bool), Win32Error>
         0x40 => Ok((true, true, true)),    // PAGE_EXECUTE_READWRITE
         _ => Err(Win32Error::Unsupported {
             feature: "VirtualAlloc page protection flags",
+        }),
+    }
+}
+
+fn protection_flags(permissions: (bool, bool, bool)) -> Result<u32, Win32Error> {
+    match permissions {
+        (false, false, false) => Ok(0x01),
+        (true, false, false) => Ok(0x02),
+        (true, true, false) => Ok(0x04),
+        (false, false, true) => Ok(0x10),
+        (true, false, true) => Ok(0x20),
+        (true, true, true) => Ok(0x40),
+        _ => Err(Win32Error::Unsupported {
+            feature: "VirtualProtect permission combination",
         }),
     }
 }
@@ -2525,8 +3003,39 @@ mod tests {
             "UnhandledExceptionFilter",
             "LoadLibraryA",
             "LoadLibraryW",
+            "EncodePointer",
+            "DecodePointer",
+            "InitializeCriticalSectionAndSpinCount",
+            "InterlockedIncrement",
+            "InterlockedDecrement",
+            "InterlockedExchange",
+            "InterlockedCompareExchange",
+            "InterlockedExchangeAdd",
+            "GetCurrentProcess",
+            "GetCurrentThread",
+            "GetThreadPreferredUILanguages",
+            "GetFullPathNameA",
+            "GetFullPathNameW",
+            "GetFileTime",
+            "OutputDebugStringA",
+            "OutputDebugStringW",
+            "GetShortPathNameA",
+            "GetShortPathNameW",
+            "GetLongPathNameA",
+            "GetLongPathNameW",
+            "VirtualProtect",
+            "LocalAlloc",
+            "LocalFree",
         ] {
             assert!(registry.resolve(&ApiKey::new(MODULE, name)).is_some());
         }
+    }
+
+    #[test]
+    fn resolves_windows_paths_lexically() {
+        assert_eq!(
+            absolute_windows_path(r"C:\VNRT\game", r"..\data\.\script.bin").unwrap(),
+            r"C:\VNRT\data\script.bin"
+        );
     }
 }

@@ -1,5 +1,40 @@
 use super::*;
 
+pub(super) struct TokenManager {
+    next_handle: u32,
+    objects: BTreeMap<u32, u32>,
+}
+
+impl TokenManager {
+    pub(super) fn new() -> Self {
+        Self {
+            next_handle: 0x0006_0000,
+            objects: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn open(&mut self, desired_access: u32) -> Result<Handle, Win32Error> {
+        let handle = self.next_handle;
+        self.next_handle = self
+            .next_handle
+            .checked_add(4)
+            .ok_or(Win32Error::HandleExhausted)?;
+        self.objects.insert(handle, desired_access);
+        Ok(Handle(handle))
+    }
+
+    pub(super) fn close(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        self.objects
+            .remove(&handle.0)
+            .map(|_| ())
+            .ok_or(Win32Error::InvalidHandle(handle.0))
+    }
+
+    pub(super) fn contains(&self, handle: Handle) -> bool {
+        self.objects.contains_key(&handle.0)
+    }
+}
+
 pub(super) struct GuestMutex {
     name: Option<String>,
     owner: Option<u32>,

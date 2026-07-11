@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn virtual_reservation_commits_subranges_lazily() {
+    let mut memory = GuestMemory::new();
+    let mut allocator = GuestRegionAllocator::new(0x5000_0000, 0x5001_0000);
+    let base = allocator.reserve(&memory, 0x4000).unwrap();
+    let mut byte = [0_u8; 1];
+    assert!(memory.read(base, &mut byte).is_err());
+
+    let committed = GuestAddress(base.0 + 0x1000);
+    allocator
+        .commit(&mut memory, committed, 0x1000, Permissions::READ_WRITE)
+        .unwrap();
+    memory.write(committed, &[0x5a]).unwrap();
+    memory.read(committed, &mut byte).unwrap();
+    assert_eq!(byte, [0x5a]);
+    assert!(memory.read(base, &mut byte).is_err());
+
+    allocator.free(&mut memory, base).unwrap();
+    assert!(memory.read(committed, &mut byte).is_err());
+}
+
+#[test]
+fn host_thunks_are_readable_but_not_guest_writable() {
+    let mut memory = GuestMemory::new();
+    initialize_host_thunk_region(&mut memory).unwrap();
+    let mut stub = [0_u8; 4];
+    memory
+        .read(GuestAddress(HOST_THUNK_BASE), &mut stub)
+        .unwrap();
+    assert_eq!(stub, [0xc3, 0x90, 0x90, 0x90]);
+    assert!(
+        memory
+            .write(GuestAddress(HOST_THUNK_BASE), &[0xcc])
+            .is_err()
+    );
+}
+
+#[test]
 fn alignment_is_checked() {
     assert_eq!(align_up(1, 4096), Some(4096));
     assert_eq!(align_up(4096, 4096), Some(4096));

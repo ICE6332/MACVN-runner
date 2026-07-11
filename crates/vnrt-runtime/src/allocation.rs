@@ -243,7 +243,12 @@ impl GuestHeapManager {
 pub(super) struct GuestRegionAllocator {
     next: u32,
     limit: u32,
-    allocations: BTreeMap<u32, u32>,
+    allocations: BTreeMap<u32, VirtualRegion>,
+}
+
+struct VirtualRegion {
+    size: u32,
+    committed_pages: BTreeSet<u32>,
 }
 
 impl GuestRegionAllocator {
@@ -266,26 +271,76 @@ impl GuestRegionAllocator {
         requested_size: u32,
         permissions: Permissions,
     ) -> Result<GuestAddress, Win32Error> {
-        let mapped_size =
+        let address = self.reserve(memory, requested_size)?;
+        self.commit(memory, address, requested_size, permissions)?;
+        Ok(address)
+    }
+
+    pub(super) fn reserve(
+        &mut self,
+        memory: &GuestMemory,
+        requested_size: u32,
+    ) -> Result<GuestAddress, Win32Error> {
+        let reserved_size =
             align_up(requested_size.max(1), PAGE_SIZE_U32).ok_or(Win32Error::OutOfMemory)?;
         let end = self
             .next
-            .checked_add(mapped_size)
+            .checked_add(reserved_size)
             .filter(|end| *end <= self.limit)
             .ok_or(Win32Error::OutOfMemory)?;
         let address = GuestAddress(self.next);
         if !memory
-            .is_range_free(address, mapped_size)
+            .is_range_free(address, reserved_size)
             .map_err(|error| Win32Error::GuestMemory(error.to_string()))?
         {
             return Err(Win32Error::OutOfMemory);
         }
-        memory
-            .map_range(address, mapped_size, permissions)
-            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
-        self.allocations.insert(address.0, mapped_size);
+        self.allocations.insert(
+            address.0,
+            VirtualRegion {
+                size: reserved_size,
+                committed_pages: BTreeSet::new(),
+            },
+        );
         self.next = end;
         Ok(address)
+    }
+
+    pub(super) fn commit(
+        &mut self,
+        memory: &mut GuestMemory,
+        address: GuestAddress,
+        requested_size: u32,
+        permissions: Permissions,
+    ) -> Result<(), Win32Error> {
+        let start = address.0 & !(PAGE_SIZE_U32 - 1);
+        let end = address
+            .0
+            .checked_add(requested_size.max(1))
+            .and_then(|end| align_up(end, PAGE_SIZE_U32))
+            .ok_or(Win32Error::OutOfMemory)?;
+        let (_, region) = self
+            .allocations
+            .range_mut(..=start)
+            .next_back()
+            .filter(|(base, region)| start >= **base && end <= base.saturating_add(region.size))
+            .ok_or(Win32Error::InvalidAllocation { address: address.0 })?;
+        let mut page = start;
+        while page < end {
+            if region.committed_pages.insert(page) {
+                memory
+                    .map_range(GuestAddress(page), PAGE_SIZE_U32, permissions)
+                    .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+            } else {
+                memory
+                    .protect_range(GuestAddress(page), PAGE_SIZE_U32, permissions)
+                    .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+            }
+            page = page
+                .checked_add(PAGE_SIZE_U32)
+                .ok_or(Win32Error::OutOfMemory)?;
+        }
+        Ok(())
     }
 
     pub(super) fn free(
@@ -293,14 +348,15 @@ impl GuestRegionAllocator {
         memory: &mut GuestMemory,
         address: GuestAddress,
     ) -> Result<(), Win32Error> {
-        let mapped_size = self
+        let region = self
             .allocations
             .get(&address.0)
-            .copied()
             .ok_or(Win32Error::InvalidAllocation { address: address.0 })?;
-        memory
-            .unmap_range(address, mapped_size)
-            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        for page in &region.committed_pages {
+            memory
+                .unmap_range(GuestAddress(*page), PAGE_SIZE_U32)
+                .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        }
         self.allocations.remove(&address.0);
         Ok(())
     }

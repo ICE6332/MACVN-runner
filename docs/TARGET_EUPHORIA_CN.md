@@ -35,6 +35,23 @@ The first target-relevant NTDLL semantics are implemented:
 - `RtlInitUnicodeString` using the 32-bit `UNICODE_STRING` layout.
 - `RtlAcquirePebLock` and `RtlReleasePebLock` as documented single-thread no-ops.
 
-The next step is to finish the export census, then implement the first executed
-section/view or object API from its actual arguments. The HD executable remains
-useful as a comparison path but is not the primary target.
+The export census now completes and the launcher maps an unpacked child image
+around `0x70100000`. Its import loader reads the synthetic DLL export images and
+has progressed through Kernel32 and NTDLL imports into ordinary Guest code.
+
+The executed compatibility path now includes:
+
+- A modeled `advapi32.dll` with process-token, `TokenUser`, SID string, and
+  cross-DLL allocation/free semantics.
+- Separate virtual address reservation and page commitment, plus
+  `VirtualProtect` permission transitions and readable Host thunk facades.
+- Windows full/short/long path conversion, file-time queries, and NT DOS-path
+  conversion with owned `UNICODE_STRING` buffers.
+- Target-executed x87 integer loads/stores, float loads/stores, stack behavior,
+  and multiply/add operations.
+
+The current frontier is a bad indirect Guest control target (`0x00000002`) after
+the first x87-heavy main-program path. The next diagnostic should retain recent
+indirect `CALL`/`JMP`/`RET` origins so the value can be traced to its producer.
+The HD executable remains useful as a comparison path but is not the primary
+target.

@@ -18,7 +18,7 @@ use process::*;
 mod tests;
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,6 +40,7 @@ use vnrt_x86::{
 /// External targets occupy a reserved, unmapped region near the top of the
 /// 32-bit address space. Reaching one is intercepted before instruction fetch.
 const HOST_THUNK_BASE: u32 = 0xfffe_0000;
+const HOST_THUNK_REGION_SIZE: u32 = 0x0001_0000;
 const TLS_CALLBACK_RETURN_ADDRESS: u32 = 0xffff_fffc;
 const HOST_CALLBACK_RETURN_ADDRESS: u32 = 0xffff_fff8;
 const MAX_TLS_CALLBACKS: usize = 64;
@@ -225,6 +226,7 @@ pub struct Runtime {
     unhandled_exception_filter: u32,
     mutexes: MutexManager,
     events: EventManager,
+    tokens: TokenManager,
     com_initialization_count: u32,
     cursor_display_count: i32,
     focused_window: u32,
@@ -281,6 +283,7 @@ impl Runtime {
         let image = vnrt_pe::parse(bytes)?;
         let mut memory = GuestMemory::new();
         map_image(&mut memory, bytes, &image)?;
+        initialize_host_thunk_region(&mut memory)?;
         let import_thunks = bind_imports(&mut memory, &image)?;
         let mut import_thunks = import_thunks;
         let host_modules = initialize_host_modules(&mut memory, &api_registry, &mut import_thunks)?;
@@ -354,6 +357,7 @@ impl Runtime {
             unhandled_exception_filter: 0,
             mutexes: MutexManager::new(),
             events: EventManager::new(),
+            tokens: TokenManager::new(),
             com_initialization_count: 0,
             cursor_display_count: 0,
             focused_window: 0,
@@ -659,6 +663,7 @@ impl Runtime {
             unhandled_exception_filter: &mut self.unhandled_exception_filter,
             mutexes: &mut self.mutexes,
             events: &mut self.events,
+            tokens: &mut self.tokens,
             com_initialization_count: &mut self.com_initialization_count,
             cursor_display_count: &mut self.cursor_display_count,
             focused_window: &mut self.focused_window,

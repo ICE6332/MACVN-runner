@@ -203,6 +203,12 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Return access permissions for the mapped page containing `address`.
+    #[must_use]
+    pub fn permissions_at(&self, address: GuestAddress) -> Option<Permissions> {
+        self.page(address).map(|page| page.permissions)
+    }
+
     /// Remove a page-aligned range from the address space.
     ///
     /// Validation is transactional: if any page is absent, no pages are

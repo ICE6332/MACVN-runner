@@ -2,7 +2,8 @@
 
 use vnrt_memory::GuestAddress;
 use vnrt_win32::{
-    ApiKey, ApiRegistry, HostCallContext, HostCallHandler, UnsupportedApi, Win32Error,
+    ApiKey, ApiRegistry, Handle, HostCallContext, HostCallHandler, PROCESS_HEAP_HANDLE,
+    UnsupportedApi, Win32Error, encode_utf16_z, read_utf16_z,
 };
 
 const MODULE: &str = "ntdll.dll";
@@ -27,6 +28,18 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "NtWriteVirtualMemory"),
         VirtualMemoryCopy { write: true },
     );
+    registry.register(
+        ApiKey::new(MODULE, "NtSetInformationProcess"),
+        NtSetInformationProcess,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "RtlDosPathNameToNtPathName_U"),
+        RtlDosPathNameToNtPathName,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "RtlFreeUnicodeString"),
+        RtlFreeUnicodeString,
+    );
     for (name, feature) in [
         ("CsrClientCallServer", "CSR client/server call"),
         ("NtContinue", "NtContinue context restoration"),
@@ -47,10 +60,15 @@ pub fn register(registry: &mut ApiRegistry) {
         ("NtOpenThread", "NT thread opening"),
         ("NtQueryKey", "NT registry key metadata query"),
         ("NtQueryAttributesFile", "NT file attribute query"),
+        ("NtQueryDirectoryFile", "NT directory enumeration"),
         ("NtQueryFullAttributesFile", "NT full file attribute query"),
         ("NtQueryInformationProcess", "NT process information query"),
         ("NtQueryInformationFile", "NT file information query"),
         ("NtQueryInformationThread", "NT thread information query"),
+        (
+            "NtQueryVolumeInformationFile",
+            "NT volume information query",
+        ),
         ("NtQueryObject", "NT object metadata query"),
         ("NtQuerySection", "NtQuerySection metadata"),
         ("NtQuerySystemInformation", "NT system information query"),
@@ -59,7 +77,6 @@ pub fn register(registry: &mut ApiRegistry) {
         ("NtProtectVirtualMemory", "NT virtual-memory protection"),
         ("NtReadFile", "NT file reading"),
         ("NtResumeThread", "NT thread resumption"),
-        ("NtSetInformationProcess", "NT process information update"),
         ("NtSetInformationFile", "NT file information update"),
         ("NtSetInformationThread", "NT thread information update"),
         ("NtSetValueKey", "NT registry value update"),
@@ -68,11 +85,6 @@ pub fn register(registry: &mut ApiRegistry) {
         ("NtUnmapViewOfSection", "NT section view unmapping"),
         ("NtWriteFile", "NT file writing"),
         ("RtlNtStatusToDosError", "NTSTATUS to Win32 error mapping"),
-        (
-            "RtlDosPathNameToNtPathName_U",
-            "DOS path to NT path conversion",
-        ),
-        ("RtlFreeUnicodeString", "NT Unicode string release"),
         (
             "RtlExpandEnvironmentStrings_U",
             "NT environment string expansion",
@@ -85,6 +97,7 @@ pub fn register(registry: &mut ApiRegistry) {
             "RtlSetEnvironmentVariable",
             "NT environment variable update",
         ),
+        ("ZwQueryDirectoryFile", "NT directory enumeration alias"),
     ] {
         registry.register(ApiKey::new(MODULE, name), UnsupportedApi::new(feature));
     }
@@ -105,6 +118,15 @@ struct VirtualMemoryCopy {
 
 #[derive(Debug, Clone, Copy)]
 struct RtlInitUnicodeString;
+
+#[derive(Debug, Clone, Copy)]
+struct NtSetInformationProcess;
+
+#[derive(Debug, Clone, Copy)]
+struct RtlDosPathNameToNtPathName;
+
+#[derive(Debug, Clone, Copy)]
+struct RtlFreeUnicodeString;
 
 impl HostCallHandler for PebLock {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -190,6 +212,106 @@ impl HostCallHandler for RtlInitUnicodeString {
         descriptor[4..8].copy_from_slice(&buffer.to_le_bytes());
         context.write_memory(destination, &descriptor)?;
         context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for NtSetInformationProcess {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        const PROCESS_EXECUTE_FLAGS: u32 = 34;
+        if context.argument_u32(0)? != u32::MAX {
+            return Err(Win32Error::Unsupported {
+                feature: "NtSetInformationProcess for a non-current process",
+            });
+        }
+        if context.argument_u32(1)? != PROCESS_EXECUTE_FLAGS || context.argument_u32(3)? != 4 {
+            return Err(Win32Error::Unsupported {
+                feature: "NtSetInformationProcess class other than ProcessExecuteFlags",
+            });
+        }
+        let flags = read_u32(context, GuestAddress(context.argument_u32(2)?))?;
+        if flags & !0xff != 0 {
+            return Err(Win32Error::InvalidArgument(
+                "unsupported ProcessExecuteFlags bits",
+            ));
+        }
+        // VNRT already enforces execute permission per Guest page. The native
+        // process-wide DEP preference therefore needs no additional state.
+        context.set_return_u32(0); // STATUS_SUCCESS
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for RtlDosPathNameToNtPathName {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let dos_path = read_utf16_z(context, GuestAddress(context.argument_u32(0)?))?;
+        let nt_path = if let Some(unc) = dos_path.strip_prefix(r"\\") {
+            format!(r"\??\UNC\{unc}")
+        } else {
+            format!(r"\??\{dos_path}")
+        };
+        let encoded = encode_utf16_z(&nt_path);
+        let byte_length = u16::try_from(encoded.len().saturating_sub(2))
+            .map_err(|_| Win32Error::InvalidArgument("NT path is too long"))?;
+        let maximum_length = u16::try_from(encoded.len())
+            .map_err(|_| Win32Error::InvalidArgument("NT path is too long"))?;
+        let allocation = context.allocate_heap_memory(
+            Handle(PROCESS_HEAP_HANDLE),
+            u32::try_from(encoded.len()).map_err(|_| Win32Error::OutOfMemory)?,
+        )?;
+        context.write_memory(allocation, &encoded)?;
+
+        let mut descriptor = [0_u8; 8];
+        descriptor[0..2].copy_from_slice(&byte_length.to_le_bytes());
+        descriptor[2..4].copy_from_slice(&maximum_length.to_le_bytes());
+        descriptor[4..8].copy_from_slice(&allocation.0.to_le_bytes());
+        context.write_memory(GuestAddress(context.argument_u32(1)?), &descriptor)?;
+
+        let file_part_output = GuestAddress(context.argument_u32(2)?);
+        if file_part_output.0 != 0 {
+            let file_part_units = nt_path
+                .rfind('\\')
+                .map_or(0, |index| nt_path[..=index].encode_utf16().count());
+            let file_part = allocation
+                .0
+                .checked_add(
+                    u32::try_from(file_part_units)
+                        .ok()
+                        .and_then(|units| units.checked_mul(2))
+                        .ok_or(Win32Error::OutOfMemory)?,
+                )
+                .ok_or(Win32Error::OutOfMemory)?;
+            context.write_memory(file_part_output, &file_part.to_le_bytes())?;
+        }
+        if context.argument_u32(3)? != 0 {
+            return Err(Win32Error::Unsupported {
+                feature: "RtlDosPathNameToNtPathName_U relative-name output",
+            });
+        }
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for RtlFreeUnicodeString {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let descriptor = GuestAddress(context.argument_u32(0)?);
+        let buffer = read_u32(
+            context,
+            GuestAddress(
+                descriptor
+                    .0
+                    .checked_add(4)
+                    .ok_or(Win32Error::InvalidArgument("UNICODE_STRING overflow"))?,
+            ),
+        )?;
+        if buffer != 0 {
+            context.free_heap_memory(Handle(PROCESS_HEAP_HANDLE), GuestAddress(buffer))?;
+        }
+        context.write_memory(descriptor, &[0; 8])?;
+        context.set_stdcall_cleanup(4);
         Ok(())
     }
 }
@@ -284,10 +406,12 @@ mod tests {
             "NtOpenThread",
             "NtQueryKey",
             "NtQueryAttributesFile",
+            "NtQueryDirectoryFile",
             "NtQueryFullAttributesFile",
             "NtQueryInformationProcess",
             "NtQueryInformationFile",
             "NtQueryInformationThread",
+            "NtQueryVolumeInformationFile",
             "NtQueryObject",
             "NtQuerySection",
             "NtQuerySystemInformation",
@@ -315,6 +439,7 @@ mod tests {
             "RtlAcquirePebLock",
             "RtlInitUnicodeString",
             "RtlReleasePebLock",
+            "ZwQueryDirectoryFile",
         ] {
             assert!(registry.resolve(&ApiKey::new(MODULE, name)).is_some());
         }

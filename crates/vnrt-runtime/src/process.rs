@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn initialize_host_thunk_region(memory: &mut GuestMemory) -> Result<(), RuntimeError> {
+    memory.map_range(
+        GuestAddress(HOST_THUNK_BASE),
+        HOST_THUNK_REGION_SIZE,
+        Permissions::READ_WRITE,
+    )?;
+    let mut bytes = vec![0_u8; HOST_THUNK_REGION_SIZE as usize];
+    for stub in bytes.chunks_exact_mut(4) {
+        // A tiny readable x86 facade for software that inspects API entry
+        // bytes. Execution is still intercepted by ThunkResolver before fetch.
+        stub.copy_from_slice(&[0xc3, 0x90, 0x90, 0x90]); // RET; NOP x3
+    }
+    memory.write(GuestAddress(HOST_THUNK_BASE), &bytes)?;
+    memory.protect_range(
+        GuestAddress(HOST_THUNK_BASE),
+        HOST_THUNK_REGION_SIZE,
+        Permissions::READ_EXECUTE,
+    )?;
+    Ok(())
+}
+
 /// Install the small subset of 32-bit TEB/PEB fields used by process startup.
 /// Unmodeled pointers remain zero so unsupported consumers fail predictably.
 pub(super) fn initialize_win32_process_structures(

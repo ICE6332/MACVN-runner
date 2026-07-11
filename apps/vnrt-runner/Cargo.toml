@@ -10,6 +10,7 @@ default = []
 sdl3-backend = ["vnrt-runtime/sdl3-backend"]
 
 [dependencies]
+vnrt-advapi32 = { path = "../../crates/vnrt-advapi32" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

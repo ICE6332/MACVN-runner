@@ -619,6 +619,26 @@ pub trait HostCallContext {
         write: bool,
         execute: bool,
     ) -> Result<GuestAddress, Win32Error>;
+    /// Reserve an address range without committing backing Guest pages.
+    fn reserve_virtual_memory(&mut self, size: u32) -> Result<GuestAddress, Win32Error>;
+    /// Commit pages inside an existing virtual-memory reservation.
+    fn commit_virtual_memory(
+        &mut self,
+        address: GuestAddress,
+        size: u32,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> Result<(), Win32Error>;
+    /// Change protection on mapped Guest pages and return the previous flags.
+    fn protect_virtual_memory(
+        &mut self,
+        address: GuestAddress,
+        size: u32,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> Result<(bool, bool, bool), Win32Error>;
     /// Release a complete virtual-memory allocation.
     fn free_virtual_memory(&mut self, address: GuestAddress) -> Result<(), Win32Error>;
     /// Look up a loaded Host module by normalized DLL name.
@@ -647,6 +667,14 @@ pub trait HostCallContext {
     fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
     /// Close a file or synchronization-object handle.
     fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Open a token handle for the current process pseudo handle.
+    fn open_process_token(
+        &mut self,
+        process: Handle,
+        desired_access: u32,
+    ) -> Result<Handle, Win32Error>;
+    /// Whether a token handle is currently open.
+    fn token_is_open(&self, token: Handle) -> bool;
     /// Create or reopen a named mutex, returning whether it already existed.
     fn create_mutex(
         &mut self,

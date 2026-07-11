@@ -12,6 +12,7 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) unhandled_exception_filter: &'a mut u32,
     pub(super) mutexes: &'a mut MutexManager,
     pub(super) events: &'a mut EventManager,
+    pub(super) tokens: &'a mut TokenManager,
     pub(super) com_initialization_count: &'a mut u32,
     pub(super) cursor_display_count: &'a mut i32,
     pub(super) focused_window: &'a mut u32,
@@ -314,6 +315,57 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.virtual_memory.free(self.memory, address)
     }
 
+    fn reserve_virtual_memory(&mut self, size: u32) -> Result<GuestAddress, Win32Error> {
+        self.virtual_memory.reserve(self.memory, size)
+    }
+
+    fn commit_virtual_memory(
+        &mut self,
+        address: GuestAddress,
+        size: u32,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> Result<(), Win32Error> {
+        self.virtual_memory.commit(
+            self.memory,
+            address,
+            size,
+            Permissions::new(read, write, execute),
+        )
+    }
+
+    fn protect_virtual_memory(
+        &mut self,
+        address: GuestAddress,
+        size: u32,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> Result<(bool, bool, bool), Win32Error> {
+        if size == 0 {
+            return Err(Win32Error::InvalidArgument("zero virtual protection size"));
+        }
+        let start = address.0 & !(PAGE_SIZE_U32 - 1);
+        let end = address
+            .0
+            .checked_add(size)
+            .and_then(|end| align_up(end, PAGE_SIZE_U32))
+            .ok_or(Win32Error::OutOfMemory)?;
+        let old = self
+            .memory
+            .permissions_at(GuestAddress(start))
+            .ok_or(Win32Error::InvalidAllocation { address: address.0 })?;
+        self.memory
+            .protect_range(
+                GuestAddress(start),
+                end - start,
+                Permissions::new(read, write, execute),
+            )
+            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        Ok((old.read, old.write, old.execute))
+    }
+
     fn loaded_module_handle(&self, name: &str) -> Option<GuestAddress> {
         let mut normalized = name.to_ascii_lowercase();
         if !normalized.contains('.') {
@@ -394,7 +446,23 @@ impl HostCallContext for RuntimeHostContext<'_> {
             self.mutexes
                 .close(handle)
                 .or_else(|_| self.events.close(handle))
+                .or_else(|_| self.tokens.close(handle))
         }
+    }
+
+    fn open_process_token(
+        &mut self,
+        process: Handle,
+        desired_access: u32,
+    ) -> Result<Handle, Win32Error> {
+        if process.0 != u32::MAX {
+            return Err(Win32Error::InvalidHandle(process.0));
+        }
+        self.tokens.open(desired_access)
+    }
+
+    fn token_is_open(&self, token: Handle) -> bool {
+        self.tokens.contains(token)
     }
 
     fn create_mutex(

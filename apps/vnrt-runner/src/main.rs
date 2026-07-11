@@ -12,7 +12,7 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use vnrt_runtime::{RunLimits, RunOutcome, Runtime, RuntimeConfig};
-use vnrt_win32::ApiRegistry;
+use vnrt_win32::{ApiRegistry, GuestAddress};
 
 #[derive(Debug, Parser)]
 #[command(about = "Load and interpret a PE32 executable with VNRT")]
@@ -34,6 +34,7 @@ fn main() -> Result<ExitCode> {
         .with_context(|| format!("failed to read {}", arguments.path.display()))?;
 
     let mut registry = ApiRegistry::new();
+    vnrt_advapi32::register(&mut registry);
     vnrt_gdi32::register(&mut registry);
     vnrt_kernel32::register(&mut registry);
     vnrt_ntdll::register(&mut registry);
@@ -71,6 +72,7 @@ fn main() -> Result<ExitCode> {
                 fs_base = format_args!("{:#010x}", snapshot.fs_base),
                 instruction_bytes = %format_bytes(&snapshot.instruction_bytes),
                 stack_words = ?snapshot.stack_words,
+                stack_pointer_previews = ?stack_pointer_previews(&runtime, &snapshot.stack_words),
                 exception_chain = ?snapshot.exception_chain,
                 recent_host_calls = ?snapshot.recent_host_calls,
                 "guest execution failed"
@@ -85,6 +87,39 @@ fn main() -> Result<ExitCode> {
         RunOutcome::Exited(code) => ExitCode::from(code.to_le_bytes()[0]),
         RunOutcome::Halted => ExitCode::SUCCESS,
     })
+}
+
+fn stack_pointer_previews(runtime: &Runtime, words: &[u32]) -> Vec<(u32, String)> {
+    words
+        .iter()
+        .copied()
+        .filter_map(|address| {
+            let mut bytes = [0_u8; 64];
+            runtime
+                .memory
+                .read(GuestAddress(address), &mut bytes)
+                .ok()?;
+            let ascii = bytes
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || *byte == b' ' {
+                        char::from(*byte)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect::<String>();
+            let utf16 = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .take_while(|unit| *unit != 0)
+                .collect::<Vec<_>>();
+            let utf16 = String::from_utf16(&utf16).unwrap_or_default();
+            (!ascii.is_empty() || !utf16.is_empty())
+                .then(|| (address, format!("ascii={ascii:?}, utf16={utf16:?}")))
+        })
+        .collect()
 }
 
 fn emit_guest_output(runtime: &Runtime) -> io::Result<()> {

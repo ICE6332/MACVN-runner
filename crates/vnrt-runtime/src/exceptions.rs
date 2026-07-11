@@ -51,10 +51,15 @@ impl Runtime {
                     .and_then(|word| self.memory.read_u32(GuestAddress(word)).ok())
             })
             .collect::<Vec<_>>();
+        let fault_pointer_previews = fault_stack_words
+            .iter()
+            .filter_map(|address| preview_pointer(&self.memory, *address))
+            .collect::<Vec<_>>();
         debug!(
             code,
             address = address.0,
             stack_words = ?fault_stack_words,
+            stack_pointer_previews = ?fault_pointer_previews,
             "dispatching synchronous Guest exception"
         );
         let registration =
@@ -223,4 +228,28 @@ impl Runtime {
         };
         Ok(())
     }
+}
+
+fn preview_pointer(memory: &GuestMemory, address: u32) -> Option<(u32, String)> {
+    let mut bytes = [0_u8; 64];
+    memory.read(GuestAddress(address), &mut bytes).ok()?;
+    let ascii = bytes
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>();
+    let utf16 = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    let utf16 = String::from_utf16(&utf16).unwrap_or_default();
+    (!ascii.is_empty() || !utf16.is_empty())
+        .then(|| (address, format!("ascii={ascii:?}, utf16={utf16:?}")))
 }
