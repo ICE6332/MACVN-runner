@@ -109,7 +109,7 @@ amount of compatibility surface, rather than broad Windows coverage.
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes,
 the NTDLL export census is resolved, and an unpacked child image is mapped near
 `0x70100000`. The invalid indirect-target failure has been traced and removed.
-Continue from the current `GetTimeZoneInformation` export probe until the child
+Continue from the current `SetEndOfFile` export probe until the child
 finishes Kernel32 resolution and enters engine initialization.
 
 ## Following target milestone: complete target and first real window

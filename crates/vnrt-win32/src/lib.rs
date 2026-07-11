@@ -466,6 +466,24 @@ impl ProcessIo {
         Ok(if metadata.is_directory { 0x10 } else { 0x20 })
     }
 
+    /// Copy one Guest file within the configured filesystem root.
+    pub fn copy_file(
+        &self,
+        source: &str,
+        destination: &str,
+        fail_if_exists: bool,
+    ) -> Result<(), Win32Error> {
+        if fail_if_exists && self.filesystem.metadata(destination).is_ok() {
+            return Err(Win32Error::Io {
+                operation: "copy",
+                path: destination.to_owned(),
+                message: "destination already exists".to_owned(),
+            });
+        }
+        let bytes = self.filesystem.read(source)?;
+        self.filesystem.write(destination, &bytes)
+    }
+
     /// Close a file handle.
     pub fn close(&mut self, handle: Handle) -> Result<(), Win32Error> {
         self.files
@@ -697,6 +715,8 @@ pub trait HostCallContext {
         write: bool,
         execute: bool,
     ) -> Result<(bool, bool, bool), Win32Error>;
+    /// Test whether every page in a Guest range permits writes.
+    fn is_memory_writable(&self, address: GuestAddress, size: u32) -> bool;
     /// Release a complete virtual-memory allocation.
     fn free_virtual_memory(&mut self, address: GuestAddress) -> Result<(), Win32Error>;
     /// Look up a loaded Host module by normalized DLL name.
@@ -731,6 +751,13 @@ pub trait HostCallContext {
     fn create_directory(&mut self, path: &str) -> Result<(), Win32Error>;
     /// Return Win32 file-attribute flags for one guest-visible path.
     fn file_attributes(&self, path: &str) -> Result<u32, Win32Error>;
+    /// Copy one guest-visible file within the filesystem sandbox.
+    fn copy_file(
+        &mut self,
+        source: &str,
+        destination: &str,
+        fail_if_exists: bool,
+    ) -> Result<(), Win32Error>;
     /// Close a file or synchronization-object handle.
     fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error>;
     /// Open a token handle for the current process pseudo handle.
@@ -774,6 +801,8 @@ pub trait HostCallContext {
     fn file_size(&self, handle: Handle) -> Result<u64, Win32Error>;
     /// Return a pseudo handle for stdin, stdout, or stderr selectors.
     fn standard_handle(&self, selector: i32) -> Option<Handle>;
+    /// Replace stdin, stdout, or stderr and return whether the selector was valid.
+    fn set_standard_handle(&mut self, selector: i32, handle: Handle) -> Result<bool, Win32Error>;
     /// Write bytes to a supported output handle.
     fn write_handle(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, Win32Error>;
     /// Move a disk-file cursor and return the absolute byte position.

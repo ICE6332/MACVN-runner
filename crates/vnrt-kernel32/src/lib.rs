@@ -52,7 +52,42 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "GetSystemTimeAsFileTime"),
         GetSystemTimeAsFileTime,
     );
-    registry.register(ApiKey::new(MODULE, "GetLocalTime"), GetLocalTime);
+    registry.register(
+        ApiKey::new(MODULE, "GetLocalTime"),
+        GetCalendarTime {
+            offset_seconds: 9 * 3_600,
+        },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetSystemTime"),
+        GetCalendarTime { offset_seconds: 0 },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetTimeZoneInformation"),
+        GetTimeZoneInformation,
+    );
+    registry.register(ApiKey::new(MODULE, "IsBadWritePtr"), IsBadWritePtr);
+    registry.register(ApiKey::new(MODULE, "RtlUnwind"), RtlUnwind);
+    registry.register(ApiKey::new(MODULE, "IsValidLocale"), IsValidLocale);
+    registry.register(ApiKey::new(MODULE, "IsValidCodePage"), IsValidCodePage);
+    registry.register(
+        ApiKey::new(MODULE, "GetLocaleInfoA"),
+        GetLocaleInfo { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetLocaleInfoW"),
+        GetLocaleInfo { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "EnumSystemLocalesA"),
+        EnumSystemLocales { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "EnumSystemLocalesW"),
+        EnumSystemLocales { wide: true },
+    );
+    registry.register(ApiKey::new(MODULE, "CopyFileA"), CopyFile { wide: false });
+    registry.register(ApiKey::new(MODULE, "CopyFileW"), CopyFile { wide: true });
     registry.register(ApiKey::new(MODULE, "GetProcessHeap"), GetProcessHeap);
     registry.register(ApiKey::new(MODULE, "HeapCreate"), HeapCreate);
     registry.register(ApiKey::new(MODULE, "HeapDestroy"), HeapDestroy);
@@ -228,6 +263,8 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "FreeResource"), FreeResource);
     registry.register(ApiKey::new(MODULE, "CloseHandle"), CloseHandle);
     registry.register(ApiKey::new(MODULE, "GetStdHandle"), GetStdHandle);
+    registry.register(ApiKey::new(MODULE, "SetStdHandle"), SetStdHandle);
+    registry.register(ApiKey::new(MODULE, "FlushFileBuffers"), FlushFileBuffers);
     registry.register(ApiKey::new(MODULE, "WriteFile"), WriteFile);
     registry.register(ApiKey::new(MODULE, "GetFileSize"), GetFileSize);
     registry.register(ApiKey::new(MODULE, "SetFilePointer"), SetFilePointer);
@@ -245,11 +282,19 @@ pub fn register(registry: &mut ApiRegistry) {
         GetEnvironmentStrings { wide: false },
     );
     registry.register(
+        ApiKey::new(MODULE, "GetEnvironmentStrings"),
+        GetEnvironmentStrings { wide: false },
+    );
+    registry.register(
         ApiKey::new(MODULE, "GetEnvironmentStringsW"),
         GetEnvironmentStrings { wide: true },
     );
     registry.register(
         ApiKey::new(MODULE, "FreeEnvironmentStringsA"),
+        FreeEnvironmentStrings { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "FreeEnvironmentStrings"),
         FreeEnvironmentStrings { wide: false },
     );
     registry.register(
@@ -310,6 +355,14 @@ pub fn register(registry: &mut ApiRegistry) {
     );
     registry.register(
         ApiKey::new(MODULE, "GetUserDefaultLangID"),
+        GetSystemDefaultLangId,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetUserDefaultLCID"),
+        GetSystemDefaultLangId,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetSystemDefaultLCID"),
         GetSystemDefaultLangId,
     );
     registry.register(
@@ -591,7 +644,211 @@ impl HostCallHandler for QueryPerformance {
 struct GetSystemTimeAsFileTime;
 
 #[derive(Debug, Clone, Copy)]
-struct GetLocalTime;
+struct GetCalendarTime {
+    offset_seconds: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GetTimeZoneInformation;
+
+#[derive(Debug, Clone, Copy)]
+struct IsBadWritePtr;
+
+#[derive(Debug, Clone, Copy)]
+struct RtlUnwind;
+
+#[derive(Debug, Clone, Copy)]
+struct IsValidLocale;
+
+#[derive(Debug, Clone, Copy)]
+struct IsValidCodePage;
+
+#[derive(Debug, Clone, Copy)]
+struct GetLocaleInfo {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnumSystemLocales {
+    wide: bool,
+}
+
+impl HostCallHandler for EnumSystemLocales {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let callback = GuestAddress(context.argument_u32(0)?);
+        let flags = context.argument_u32(1)?;
+        if callback.0 == 0 || !matches!(flags, 1 | 2) {
+            context.set_last_error(87); // ERROR_INVALID_PARAMETER
+            context.set_return_u32(0);
+            context.set_stdcall_cleanup(8);
+            return Ok(());
+        }
+        let encoded = if self.wide {
+            encode_utf16_z("0411")
+        } else {
+            encode_ansi_z("0411")
+        };
+        let storage = context.allocate_virtual_memory(
+            u32::try_from(encoded.len()).map_err(|_| Win32Error::OutOfMemory)?,
+            true,
+            true,
+            false,
+        )?;
+        context.write_memory(storage, &encoded)?;
+        context.request_guest_callback(callback, &[storage.0])?;
+        context.set_last_error(0);
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetLocaleInfo {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let _locale = context.argument_u32(0)?;
+        let locale_type = context.argument_u32(1)? & 0x0fff_ffff;
+        let output = GuestAddress(context.argument_u32(2)?);
+        let capacity = context.argument_u32(3)?;
+        let value = match locale_type {
+            0x0000_0001 => "0411",
+            0x0000_0002 | 0x0000_1001 => "Japanese (Japan)",
+            0x0000_0003 => "JPN",
+            0x0000_0004 => "Japanese",
+            0x0000_0005 => "81",
+            0x0000_0006 => "Japan",
+            0x0000_000e => ".",
+            0x0000_000f => ",",
+            0x0000_0010 => "3;0",
+            0x0000_0011 => "2",
+            0x0000_0012 => "1",
+            0x0000_0014 => "\u{a5}",
+            0x0000_0015 => "JPY",
+            0x0000_001f => "yyyy/MM/dd",
+            0x0000_0020 => "yyyy'\u{5e74}'M'\u{6708}'d'\u{65e5}'",
+            0x0000_0028 => "AM",
+            0x0000_0029 => "PM",
+            0x0000_1003 => "H:mm:ss",
+            _ => {
+                context.set_last_error(1004); // ERROR_INVALID_FLAGS
+                context.set_return_u32(0);
+                context.set_stdcall_cleanup(16);
+                return Ok(());
+            }
+        };
+        let encoded = if self.wide {
+            encode_utf16_z(value)
+        } else {
+            encode_ansi_z(value)
+        };
+        let stride = if self.wide { 2 } else { 1 };
+        let required =
+            u32::try_from(encoded.len() / stride).map_err(|_| Win32Error::OutOfMemory)?;
+        if capacity == 0 {
+            context.set_return_u32(required);
+        } else if output.0 == 0 || capacity < required {
+            context.set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            context.set_return_u32(0);
+        } else {
+            context.write_memory(output, &encoded)?;
+            context.set_last_error(0);
+            context.set_return_u32(required);
+        }
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for IsValidCodePage {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let code_page = context.argument_u32(0)?;
+        context.set_return_u32(u32::from(matches!(code_page, 932 | 65_001)));
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for IsValidLocale {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let locale = context.argument_u32(0)? & 0x000f_ffff;
+        let flags = context.argument_u32(1)?;
+        let known = matches!(locale, 0x0400 | 0x0800 | 0x0409 | 0x0411 | 0x0804);
+        context.set_return_u32(u32::from(known && flags != 0 && flags & !3 == 0));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CopyFile {
+    wide: bool,
+}
+
+impl HostCallHandler for CopyFile {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let source_address = GuestAddress(context.argument_u32(0)?);
+        let destination_address = GuestAddress(context.argument_u32(1)?);
+        let fail_if_exists = context.argument_u32(2)? != 0;
+        let (source, destination) = if self.wide {
+            (
+                read_utf16_z(context, source_address)?,
+                read_utf16_z(context, destination_address)?,
+            )
+        } else {
+            (
+                read_ansi_z(context, source_address)?,
+                read_ansi_z(context, destination_address)?,
+            )
+        };
+        if context
+            .copy_file(&source, &destination, fail_if_exists)
+            .is_ok()
+        {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(if fail_if_exists { 80 } else { 2 });
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(12);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for RtlUnwind {
+    fn invoke(&self, _context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "kernel32!RtlUnwind Guest stack unwinding",
+        })
+    }
+}
+
+impl HostCallHandler for IsBadWritePtr {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let address = GuestAddress(context.argument_u32(0)?);
+        let size = context.argument_u32(1)?;
+        context.set_return_u32(u32::from(!context.is_memory_writable(address, size)));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetTimeZoneInformation {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let output = GuestAddress(context.argument_u32(0)?);
+        let mut bytes = [0_u8; 172];
+        bytes[0..4].copy_from_slice(&(-540_i32).to_le_bytes()); // JST is UTC+9
+        for (chunk, unit) in bytes[4..68]
+            .chunks_exact_mut(2)
+            .zip("Tokyo Standard Time".encode_utf16().chain([0]))
+        {
+            chunk.copy_from_slice(&unit.to_le_bytes());
+        }
+        context.write_memory(output, &bytes)?;
+        context.set_return_u32(0); // TIME_ZONE_ID_UNKNOWN: fixed offset, no DST
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for GetSystemTimeAsFileTime {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -602,14 +859,15 @@ impl HostCallHandler for GetSystemTimeAsFileTime {
     }
 }
 
-impl HostCallHandler for GetLocalTime {
+impl HostCallHandler for GetCalendarTime {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         const WINDOWS_TO_UNIX_SECONDS: i64 = 11_644_473_600;
         let output = GuestAddress(context.argument_u32(0)?);
         let ticks = context.system_time_filetime();
         let unix_millis = i64::try_from(ticks / 10_000)
             .unwrap_or(i64::MAX)
-            .saturating_sub(WINDOWS_TO_UNIX_SECONDS * 1_000);
+            .saturating_sub(WINDOWS_TO_UNIX_SECONDS * 1_000)
+            .saturating_add(self.offset_seconds * 1_000);
         let unix_seconds = unix_millis.div_euclid(1_000);
         let days = unix_seconds.div_euclid(86_400);
         let seconds = unix_seconds.rem_euclid(86_400);
@@ -2128,6 +2386,43 @@ impl HostCallHandler for CloseHandle {
 
 #[derive(Debug, Clone, Copy)]
 struct GetStdHandle;
+
+#[derive(Debug, Clone, Copy)]
+struct SetStdHandle;
+
+#[derive(Debug, Clone, Copy)]
+struct FlushFileBuffers;
+
+impl HostCallHandler for FlushFileBuffers {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let handle = Handle(context.argument_u32(0)?);
+        if context.file_type(handle).is_some() {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetStdHandle {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let selector = i32::from_ne_bytes(context.argument_u32(0)?.to_ne_bytes());
+        let handle = Handle(context.argument_u32(1)?);
+        if context.set_standard_handle(selector, handle)? {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(87); // ERROR_INVALID_PARAMETER
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for GetStdHandle {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {

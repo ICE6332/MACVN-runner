@@ -24,12 +24,14 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) host_modules: &'a HashMap<String, GuestAddress>,
     pub(super) command_line_ansi: GuestAddress,
     pub(super) command_line_utf16: GuestAddress,
+    pub(super) process_parameters: GuestAddress,
     pub(super) module_path: &'a str,
     pub(super) last_error: &'a mut u32,
     pub(super) error_mode: &'a mut u32,
     pub(super) process_io: &'a mut ProcessIo,
     pub(super) guest_stdout: &'a mut Vec<u8>,
     pub(super) guest_stderr: &'a mut Vec<u8>,
+    pub(super) standard_handles: &'a mut [u32; 3],
     pub(super) environment: &'a BTreeMap<String, String>,
     pub(super) current_directory: &'a mut String,
     pub(super) environment_block_ansi: GuestAddress,
@@ -367,6 +369,33 @@ impl HostCallContext for RuntimeHostContext<'_> {
         Ok((old.read, old.write, old.execute))
     }
 
+    fn is_memory_writable(&self, address: GuestAddress, size: u32) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let Some(last) = address.0.checked_add(size - 1) else {
+            return false;
+        };
+        let mut page = address.page_base().0;
+        let last_page = GuestAddress(last).page_base().0;
+        loop {
+            if !self
+                .memory
+                .permissions_at(GuestAddress(page))
+                .is_some_and(|permissions| permissions.write)
+            {
+                return false;
+            }
+            if page == last_page {
+                return true;
+            }
+            let Some(next) = page.checked_add(PAGE_SIZE_U32) else {
+                return false;
+            };
+            page = next;
+        }
+    }
+
     fn loaded_module_handle(&self, name: &str) -> Option<GuestAddress> {
         let mut normalized = name.to_ascii_lowercase();
         if !normalized.contains('.') {
@@ -456,6 +485,16 @@ impl HostCallContext for RuntimeHostContext<'_> {
 
     fn file_attributes(&self, path: &str) -> Result<u32, Win32Error> {
         self.process_io.file_attributes(path)
+    }
+
+    fn copy_file(
+        &mut self,
+        source: &str,
+        destination: &str,
+        fail_if_exists: bool,
+    ) -> Result<(), Win32Error> {
+        self.process_io
+            .copy_file(source, destination, fail_if_exists)
     }
 
     fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error> {
@@ -569,18 +608,36 @@ impl HostCallContext for RuntimeHostContext<'_> {
 
     fn standard_handle(&self, selector: i32) -> Option<Handle> {
         match selector {
-            -10 => Some(Handle(STD_INPUT_HANDLE_VALUE)),
-            -11 => Some(Handle(STD_OUTPUT_HANDLE_VALUE)),
-            -12 => Some(Handle(STD_ERROR_HANDLE_VALUE)),
+            -10 => Some(Handle(self.standard_handles[0])),
+            -11 => Some(Handle(self.standard_handles[1])),
+            -12 => Some(Handle(self.standard_handles[2])),
             _ => None,
         }
     }
 
+    fn set_standard_handle(&mut self, selector: i32, handle: Handle) -> Result<bool, Win32Error> {
+        let Some((index, offset)) = (match selector {
+            -10 => Some((0, 0x18)),
+            -11 => Some((1, 0x1c)),
+            -12 => Some((2, 0x20)),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        self.standard_handles[index] = handle.0;
+        self.memory
+            .write_u32(GuestAddress(self.process_parameters.0 + offset), handle.0)
+            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        Ok(true)
+    }
+
     fn write_handle(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, Win32Error> {
-        match handle.0 {
-            STD_OUTPUT_HANDLE_VALUE => self.guest_stdout.extend_from_slice(bytes),
-            STD_ERROR_HANDLE_VALUE => self.guest_stderr.extend_from_slice(bytes),
-            _ => return Err(Win32Error::InvalidHandle(handle.0)),
+        if handle.0 == self.standard_handles[1] {
+            self.guest_stdout.extend_from_slice(bytes);
+        } else if handle.0 == self.standard_handles[2] {
+            self.guest_stderr.extend_from_slice(bytes);
+        } else {
+            return Err(Win32Error::InvalidHandle(handle.0));
         }
         Ok(bytes.len())
     }
@@ -592,10 +649,7 @@ impl HostCallContext for RuntimeHostContext<'_> {
     fn file_type(&self, handle: Handle) -> Option<u32> {
         if self.process_io.contains(handle) {
             Some(FILE_TYPE_DISK)
-        } else if matches!(
-            handle.0,
-            STD_INPUT_HANDLE_VALUE | STD_OUTPUT_HANDLE_VALUE | STD_ERROR_HANDLE_VALUE
-        ) {
+        } else if self.standard_handles.contains(&handle.0) {
             Some(FILE_TYPE_CHAR)
         } else {
             None

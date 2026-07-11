@@ -62,6 +62,10 @@ facades currently fail with `ERROR_NOT_SUPPORTED` if they are actually invoked;
 full mapping-object lifetime and multi-context Guest scheduling remain explicit
 mainline work rather than silent fake success.
 
-The current observed unresolved import is `GetTimeZoneInformation`. No real
-User32 window has been created yet. The HD executable remains useful as a
-comparison path but is not the primary target.
+The census has continued through fixed Tokyo time-zone/system-time data,
+write-range validation, sandboxed file copying, mutable standard handles synced
+to process parameters, ANSI environment aliases, locale validation/info, and a
+real single-locale Host-to-Guest enumeration callback. The current observed
+unresolved import is `SetEndOfFile`. No real User32 window has been created yet.
+The HD executable remains useful as a comparison path but is not the primary
+target.
