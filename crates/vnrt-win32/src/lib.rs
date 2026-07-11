@@ -265,6 +265,13 @@ impl SandboxFileSystem {
     }
 
     fn resolve_existing(&self, guest_path: &str) -> Result<PathBuf, Win32Error> {
+        let normalized = guest_path
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if normalized == self.guest_root {
+            return Ok(self.root.clone());
+        }
         let resolved = self.resolve(guest_path)?;
         let relative = resolved.strip_prefix(&self.root).map_err(|_| {
             Win32Error::InvalidArgument("resolved guest path is outside filesystem root")
@@ -411,6 +418,11 @@ impl VirtualFileSystem for SandboxFileSystem {
 }
 
 fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    // Win32/DOS wildcard rules preserve `*.*` as the historical spelling for
+    // "all directory entries", including names with no dot at all.
+    if pattern.eq_ignore_ascii_case("*.*") {
+        return true;
+    }
     let pattern = pattern.to_ascii_lowercase().into_bytes();
     let value = value.to_ascii_lowercase().into_bytes();
     let (mut pattern_index, mut value_index) = (0, 0);
@@ -447,6 +459,7 @@ struct OpenFile {
     readable: bool,
     writable: bool,
     dirty: bool,
+    directory: bool,
 }
 
 struct DirectorySearch {
@@ -531,8 +544,30 @@ impl ProcessIo {
             readable,
             writable,
             dirty: false,
+            directory: false,
         })?;
         Ok((handle, existed))
+    }
+
+    /// Open an existing Guest directory as a closeable kernel handle.
+    pub fn open_directory(&mut self, path: &str) -> Result<Handle, Win32Error> {
+        let metadata = self.filesystem.metadata(path)?;
+        if !metadata.is_directory {
+            return Err(Win32Error::Io {
+                operation: "open directory",
+                path: path.to_owned(),
+                message: "path is not a directory".to_owned(),
+            });
+        }
+        self.files.insert(OpenFile {
+            path: path.to_owned(),
+            bytes: Vec::new(),
+            cursor: 0,
+            readable: false,
+            writable: false,
+            dirty: false,
+            directory: true,
+        })
     }
 
     /// Read at most `length` bytes and advance the file cursor.
@@ -541,7 +576,7 @@ impl ProcessIo {
             .files
             .get_mut(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
-        if !file.readable {
+        if file.directory || !file.readable {
             return Err(Win32Error::InvalidHandle(handle.0));
         }
         if file.cursor >= file.bytes.len() {
@@ -610,7 +645,7 @@ impl ProcessIo {
             .files
             .get_mut(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
-        if !file.writable {
+        if file.directory || !file.writable {
             return Err(Win32Error::InvalidHandle(handle.0));
         }
         let end = file
@@ -1081,6 +1116,8 @@ pub trait HostCallContext {
         writable: bool,
         disposition: u32,
     ) -> Result<(Handle, bool), Win32Error>;
+    /// Open an existing VFS directory as a closeable kernel handle.
+    fn open_directory_handle(&mut self, path: &str) -> Result<Handle, Win32Error>;
     /// Read bytes from an open file and advance its cursor.
     fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error>;
     /// Resize a writable file to its current cursor.
@@ -1469,6 +1506,7 @@ mod tests {
     fn wildcard_matching_is_case_insensitive() {
         assert!(wildcard_matches("*.ypf", "CG.YPF"));
         assert!(wildcard_matches("update?.ypf", "update3.ypf"));
+        assert!(wildcard_matches("*.*", "pac"));
         assert!(!wildcard_matches("*.ypf", "cg.ypf_old"));
     }
 
@@ -1495,6 +1533,25 @@ mod tests {
         let handle = io.open_read("SAVE.DAT").unwrap();
         assert_eq!(io.read(handle, 8).unwrap(), b"abc");
         io.close(handle).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sandbox_opens_its_guest_root_as_a_directory_handle() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("vnrt-directory-io-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut io = ProcessIo::sandboxed(&root, r"C:\GAME");
+
+        let handle = io.open_directory(r"C:\GAME").unwrap();
+        assert!(io.contains(handle));
+        assert!(io.read(handle, 1).is_err());
+        io.close(handle).unwrap();
+
         fs::remove_dir_all(root).unwrap();
     }
 }

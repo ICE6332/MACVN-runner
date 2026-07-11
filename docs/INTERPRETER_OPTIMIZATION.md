@@ -27,4 +27,9 @@ Any unsafe memory path must keep these invariants local and documented next to t
 4. Decode and translated-block caches validate every spanned page generation.
 5. Executable writes invalidate code before the next Guest instruction.
 
-The next performance stage, when profiling justifies returning to it, is a translated-block IR or JIT. The compatibility mainline resumes before that work.
+The target now justifies returning to performance work: after the compatibility
+layer exposes the `pac` directory, a one-billion-instruction run reaches its
+limit while indexing/decrypting the real YPF archives. Profile this loop before
+choosing between wider safe block execution, a compact translated-block IR, or
+a narrowly scoped direct-pointer path. A JIT remains a later option rather than
+the default next step.

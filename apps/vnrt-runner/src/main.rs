@@ -66,6 +66,19 @@ fn main() -> Result<ExitCode> {
     };
     let mut runtime = Runtime::load_with_config(&bytes, registry, config)
         .with_context(|| format!("failed to load {}", arguments.path.display()))?;
+    runtime
+        .memory
+        .set_track_executable_writes(std::env::var_os("VNRT_TRACK_EXEC_WRITES").is_some());
+    if let Some(range) = std::env::var_os("VNRT_TRACK_WRITES") {
+        runtime
+            .memory
+            .set_tracked_write_range(Some(parse_address_range(&range.to_string_lossy())?));
+    }
+    if let Some(range) = std::env::var_os("VNRT_TRACE_INSTRUCTIONS") {
+        runtime
+            .cpu
+            .set_trace_range(Some(parse_address_range(&range.to_string_lossy())?));
+    }
     let graphics = vnrt_gfx_wgpu::WgpuGraphicsDevice::new().context("failed to initialize GPU")?;
     info!(adapter = graphics.adapter_name(), "Host GPU initialized");
     runtime.set_graphics_device(Box::new(graphics));
@@ -91,6 +104,8 @@ fn main() -> Result<ExitCode> {
                 recent_control_transfers = ?snapshot.recent_control_transfers.iter().rev().take(32).collect::<Vec<_>>(),
                 control_transfer_previews = ?control_transfer_previews(&runtime, &snapshot),
                 matching_stack_transfers = ?matching_stack_transfers(&runtime, &snapshot),
+                recent_executable_writes = ?runtime.memory.executable_writes().iter().rev().take(64).collect::<Vec<_>>(),
+                traced_instructions = ?runtime.cpu.traced_instructions(),
                 "guest execution failed"
             );
             emit_guest_output(&runtime)?;
@@ -98,6 +113,20 @@ fn main() -> Result<ExitCode> {
         }
     };
     emit_guest_output(&runtime)?;
+    if std::env::var_os("VNRT_TRACE_INSTRUCTIONS").is_some() {
+        info!(
+            traced_instructions = ?runtime.cpu.traced_instructions(),
+            "Guest instruction trace completed"
+        );
+    }
+    if let Some(range) = std::env::var_os("VNRT_DUMP_MEMORY") {
+        let (start, end) = parse_address_range(&range.to_string_lossy())?;
+        let length = usize::try_from(end - start).context("memory dump range is too large")?;
+        info!(
+            memory = %memory_window(&runtime, start, 0, length),
+            "Guest memory dump completed"
+        );
+    }
     info!(?outcome, "guest stopped");
     Ok(match outcome {
         RunOutcome::Exited(code) => ExitCode::from(code.to_le_bytes()[0]),
@@ -115,6 +144,19 @@ fn memory_window(runtime: &Runtime, center: u32, before: u32, length: usize) -> 
             |_| format!("{start:#010x}: <unmapped>"),
             |_| format!("{start:#010x}: {}", format_bytes(&bytes)),
         )
+}
+
+fn parse_address_range(value: &str) -> Result<(u32, u32)> {
+    let (start, end) = value
+        .split_once('-')
+        .context("VNRT_TRACK_WRITES must be START-END")?;
+    let parse = |part: &str| {
+        u32::from_str_radix(part.trim_start_matches("0x"), 16)
+            .with_context(|| format!("invalid Guest address {part}"))
+    };
+    let range = (parse(start)?, parse(end)?);
+    anyhow::ensure!(range.0 < range.1, "tracked write range must not be empty");
+    Ok(range)
 }
 
 fn stack_pointer_previews(runtime: &Runtime, words: &[u32]) -> Vec<(u32, String)> {

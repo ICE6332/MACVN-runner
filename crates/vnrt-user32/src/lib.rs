@@ -18,7 +18,8 @@ const SYSTEM_MENU_HANDLE: u32 = 0x0002_0004;
 const DIALOG_CONTROL_HANDLE_BASE: u32 = 0x0004_0000;
 const WM_INITDIALOG: u32 = 0x0110;
 const WM_COMMAND: u32 = 0x0111;
-const STARTUP_DIALOG_ACCEPT_ID: u32 = 0x040a;
+const RT_DIALOG: u16 = 5;
+const DS_SETFONT: u32 = 0x0040;
 
 /// Guest-visible message record, analogous to the stable part of Win32 `MSG`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1874,6 +1875,7 @@ impl HostCallHandler for GetDlgItem {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let dialog = context.argument_u32(0)?;
         let control_id = context.argument_u32(1)?;
+        debug!(dialog, control_id, "looking up Guest dialog control");
         context.set_return_u32(if dialog == STARTUP_DIALOG_HANDLE && control_id != 0 {
             DIALOG_CONTROL_HANDLE_BASE | (control_id & 0xffff)
         } else {
@@ -1944,12 +1946,25 @@ impl HostCallHandler for DialogBoxParamA {
             outer_caller = context.argument_u32(8).ok(),
             "opening Guest dialog"
         );
+        let dialog = load_dialog_template(context, template)?;
+        if let Some(dialog) = &dialog {
+            debug!(
+                template,
+                title = dialog.title,
+                controls = ?dialog.controls,
+                "resolved Guest dialog template"
+            );
+        }
         if instance == 0 || template == 0 || parent != 0 || dialog_proc == 0 {
             return Err(Win32Error::InvalidArgument(
                 "DialogBoxParamA bootstrap arguments",
             ));
         }
-        context.set_return_u32(STARTUP_DIALOG_ACCEPT_ID);
+        let accept_id = dialog
+            .as_ref()
+            .and_then(DialogTemplate::dismissal_control_id)
+            .unwrap_or(1);
+        context.set_return_u32(accept_id);
         context.set_stdcall_cleanup(20);
         let callback = GuestAddress(dialog_proc);
         context.register_guest_callback_target(STARTUP_DIALOG_HANDLE, callback);
@@ -1957,17 +1972,319 @@ impl HostCallHandler for DialogBoxParamA {
             callback,
             &[STARTUP_DIALOG_HANDLE, WM_INITDIALOG, 0, parameter],
         )?;
-        context.request_guest_callback(
-            callback,
-            &[
-                STARTUP_DIALOG_HANDLE,
-                WM_COMMAND,
-                STARTUP_DIALOG_ACCEPT_ID,
-                0,
-            ],
-        )?;
+        context
+            .request_guest_callback(callback, &[STARTUP_DIALOG_HANDLE, WM_COMMAND, accept_id, 0])?;
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DialogTemplate {
+    title: String,
+    controls: Vec<DialogControl>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DialogControl {
+    id: u32,
+    class: String,
+    title: String,
+}
+
+impl DialogTemplate {
+    fn dismissal_control_id(&self) -> Option<u32> {
+        self.controls
+            .iter()
+            .find(|control| control.id == 1)
+            .or_else(|| self.controls.iter().find(|control| control.id == 2))
+            .or_else(|| self.controls.iter().find(|control| control.class == "#128"))
+            .map(|control| control.id)
+    }
+}
+
+fn load_dialog_template(
+    context: &dyn HostCallContext,
+    template: u32,
+) -> Result<Option<DialogTemplate>, Win32Error> {
+    let Some((root, size)) = context.resource_directory() else {
+        return Ok(None);
+    };
+    let name = if template <= u32::from(u16::MAX) {
+        ResourceIdentifier::Id(template as u16)
+    } else {
+        ResourceIdentifier::Name(read_ansi_z(context, GuestAddress(template))?)
+    };
+    let Some(entry) = find_resource_data_entry(
+        context,
+        root,
+        size,
+        &ResourceIdentifier::Id(RT_DIALOG),
+        &name,
+    )?
+    else {
+        return Ok(None);
+    };
+    let resource_rva = read_context_u32(context, entry)?;
+    let resource_size = read_context_u32(context, GuestAddress(entry.0 + 4))?;
+    let resource_address = context
+        .main_module_base()
+        .0
+        .checked_add(resource_rva)
+        .map(GuestAddress)
+        .ok_or(Win32Error::InvalidArgument("dialog resource RVA"))?;
+    let byte_length = usize::try_from(resource_size)
+        .ok()
+        .filter(|length| *length <= 1024 * 1024)
+        .ok_or(Win32Error::InvalidArgument("dialog resource size"))?;
+    let mut bytes = vec![0; byte_length];
+    context.read_memory(resource_address, &mut bytes)?;
+    parse_dialog_template(&bytes).map(Some)
+}
+
+#[derive(Debug)]
+enum ResourceIdentifier {
+    Id(u16),
+    Name(String),
+}
+
+fn find_resource_data_entry(
+    context: &dyn HostCallContext,
+    root: GuestAddress,
+    size: u32,
+    resource_type: &ResourceIdentifier,
+    name: &ResourceIdentifier,
+) -> Result<Option<GuestAddress>, Win32Error> {
+    let Some(type_entry) = find_resource_directory_entry(context, root, size, root, resource_type)?
+    else {
+        return Ok(None);
+    };
+    let Some(type_directory) = resource_subdirectory(root, size, type_entry)? else {
+        return Ok(None);
+    };
+    let Some(name_entry) =
+        find_resource_directory_entry(context, root, size, type_directory, name)?
+    else {
+        return Ok(None);
+    };
+    let Some(language_directory) = resource_subdirectory(root, size, name_entry)? else {
+        return Ok(None);
+    };
+    let mut header = [0; 16];
+    context.read_memory(language_directory, &mut header)?;
+    let entry_count = u32::from(u16::from_le_bytes([header[12], header[13]]))
+        + u32::from(u16::from_le_bytes([header[14], header[15]]));
+    if entry_count == 0 {
+        return Ok(None);
+    }
+    let first_entry = resource_offset_address(root, size, language_directory.0 - root.0 + 16, 8)?;
+    let data_offset = read_context_u32(context, GuestAddress(first_entry.0 + 4))?;
+    if data_offset & 0x8000_0000 != 0 {
+        return Err(Win32Error::InvalidArgument(
+            "dialog resource language directory",
+        ));
+    }
+    resource_offset_address(root, size, data_offset, 16).map(Some)
+}
+
+fn find_resource_directory_entry(
+    context: &dyn HostCallContext,
+    root: GuestAddress,
+    size: u32,
+    directory: GuestAddress,
+    identifier: &ResourceIdentifier,
+) -> Result<Option<u32>, Win32Error> {
+    let mut header = [0; 16];
+    context.read_memory(directory, &mut header)?;
+    let total = u32::from(u16::from_le_bytes([header[12], header[13]]))
+        .checked_add(u32::from(u16::from_le_bytes([header[14], header[15]])))
+        .filter(|total| *total <= 4096)
+        .ok_or(Win32Error::InvalidArgument(
+            "resource directory entry count",
+        ))?;
+    for index in 0..total {
+        let relative = directory
+            .0
+            .checked_sub(root.0)
+            .and_then(|offset| offset.checked_add(16 + index * 8))
+            .ok_or(Win32Error::InvalidArgument("resource entry offset"))?;
+        let entry = resource_offset_address(root, size, relative, 8)?;
+        let name_field = read_context_u32(context, entry)?;
+        let matches = match identifier {
+            ResourceIdentifier::Id(id) => {
+                name_field & 0x8000_0000 == 0 && name_field & 0xffff == u32::from(*id)
+            }
+            ResourceIdentifier::Name(expected) => {
+                name_field & 0x8000_0000 != 0
+                    && read_resource_directory_name(context, root, size, name_field & 0x7fff_ffff)?
+                        == *expected
+            }
+        };
+        if matches {
+            return read_context_u32(context, GuestAddress(entry.0 + 4)).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn resource_subdirectory(
+    root: GuestAddress,
+    size: u32,
+    entry: u32,
+) -> Result<Option<GuestAddress>, Win32Error> {
+    if entry & 0x8000_0000 == 0 {
+        return Ok(None);
+    }
+    resource_offset_address(root, size, entry & 0x7fff_ffff, 16).map(Some)
+}
+
+fn read_resource_directory_name(
+    context: &dyn HostCallContext,
+    root: GuestAddress,
+    size: u32,
+    offset: u32,
+) -> Result<String, Win32Error> {
+    let length_address = resource_offset_address(root, size, offset, 2)?;
+    let mut length_bytes = [0; 2];
+    context.read_memory(length_address, &mut length_bytes)?;
+    let length = usize::from(u16::from_le_bytes(length_bytes));
+    let byte_length = length
+        .checked_mul(2)
+        .ok_or(Win32Error::InvalidArgument("resource name length"))?;
+    let string_address = resource_offset_address(root, size, offset + 2, byte_length as u32)?;
+    let mut bytes = vec![0; byte_length];
+    context.read_memory(string_address, &mut bytes)?;
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| Win32Error::InvalidArgument("resource name UTF-16"))
+}
+
+fn resource_offset_address(
+    root: GuestAddress,
+    size: u32,
+    offset: u32,
+    length: u32,
+) -> Result<GuestAddress, Win32Error> {
+    offset
+        .checked_add(length)
+        .filter(|end| *end <= size)
+        .and_then(|_| root.0.checked_add(offset))
+        .map(GuestAddress)
+        .ok_or(Win32Error::InvalidArgument("resource directory bounds"))
+}
+
+fn read_context_u32(
+    context: &dyn HostCallContext,
+    address: GuestAddress,
+) -> Result<u32, Win32Error> {
+    let mut bytes = [0; 4];
+    context.read_memory(address, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn parse_dialog_template(bytes: &[u8]) -> Result<DialogTemplate, Win32Error> {
+    let mut cursor = 0;
+    let extended = read_u16(bytes, 0)? == 1 && read_u16(bytes, 2)? == 0xffff;
+    let (style, control_count) = if extended {
+        cursor = 12;
+        let style = read_u32_advance(bytes, &mut cursor)?;
+        let count = read_u16_advance(bytes, &mut cursor)?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or(Win32Error::InvalidArgument("extended dialog header"))?;
+        (style, count)
+    } else {
+        let style = read_u32_advance(bytes, &mut cursor)?;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or(Win32Error::InvalidArgument("dialog header"))?;
+        let count = read_u16_advance(bytes, &mut cursor)?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or(Win32Error::InvalidArgument("dialog coordinates"))?;
+        (style, count)
+    };
+    read_dialog_field(bytes, &mut cursor)?; // menu
+    read_dialog_field(bytes, &mut cursor)?; // class
+    let title = read_dialog_field(bytes, &mut cursor)?;
+    if style & DS_SETFONT != 0 {
+        cursor = cursor
+            .checked_add(if extended { 6 } else { 2 })
+            .ok_or(Win32Error::InvalidArgument("dialog font header"))?;
+        read_dialog_field(bytes, &mut cursor)?;
+    }
+    let mut controls = Vec::with_capacity(usize::from(control_count));
+    for _ in 0..control_count {
+        cursor = align_to_dword(cursor)?;
+        let id = if extended {
+            cursor = cursor
+                .checked_add(20)
+                .ok_or(Win32Error::InvalidArgument("extended dialog item"))?;
+            read_u32_advance(bytes, &mut cursor)?
+        } else {
+            cursor = cursor
+                .checked_add(16)
+                .ok_or(Win32Error::InvalidArgument("dialog item"))?;
+            u32::from(read_u16_advance(bytes, &mut cursor)?)
+        };
+        let class = read_dialog_field(bytes, &mut cursor)?;
+        let title = read_dialog_field(bytes, &mut cursor)?;
+        let creation_size = usize::from(read_u16_advance(bytes, &mut cursor)?);
+        cursor = cursor
+            .checked_add(creation_size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(Win32Error::InvalidArgument("dialog creation data"))?;
+        controls.push(DialogControl { id, class, title });
+    }
+    Ok(DialogTemplate { title, controls })
+}
+
+fn read_dialog_field(bytes: &[u8], cursor: &mut usize) -> Result<String, Win32Error> {
+    let marker = read_u16_advance(bytes, cursor)?;
+    if marker == 0 {
+        return Ok(String::new());
+    }
+    if marker == 0xffff {
+        return Ok(format!("#{}", read_u16_advance(bytes, cursor)?));
+    }
+    let mut units = vec![marker];
+    loop {
+        let unit = read_u16_advance(bytes, cursor)?;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    Ok(String::from_utf16_lossy(&units))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Win32Error> {
+    let pair = bytes
+        .get(offset..offset + 2)
+        .ok_or(Win32Error::InvalidArgument("dialog template bounds"))?;
+    Ok(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+fn read_u16_advance(bytes: &[u8], cursor: &mut usize) -> Result<u16, Win32Error> {
+    let value = read_u16(bytes, *cursor)?;
+    *cursor += 2;
+    Ok(value)
+}
+
+fn read_u32_advance(bytes: &[u8], cursor: &mut usize) -> Result<u32, Win32Error> {
+    let word = bytes
+        .get(*cursor..*cursor + 4)
+        .ok_or(Win32Error::InvalidArgument("dialog template bounds"))?;
+    *cursor += 4;
+    Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+}
+
+fn align_to_dword(value: usize) -> Result<usize, Win32Error> {
+    value
+        .checked_add(3)
+        .map(|value| value & !3)
+        .ok_or(Win32Error::InvalidArgument("dialog item alignment"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2472,6 +2789,7 @@ impl HostCallHandler for EndDialog {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let dialog = context.argument_u32(0)?;
         let result = context.argument_u32(1)?;
+        debug!(dialog, result, "ending Guest dialog");
         context.set_return_u32(u32::from(dialog == STARTUP_DIALOG_HANDLE));
         context.set_stdcall_cleanup(8);
         if dialog == STARTUP_DIALOG_HANDLE {

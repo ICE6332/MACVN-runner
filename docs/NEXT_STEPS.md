@@ -104,7 +104,7 @@ amount of compatibility surface, rather than broad Windows coverage.
   Kernel32 export census through filesystem, time, locale, process, mapping,
   and initial thread probes.
 
-## Next highest-leverage milestone: finish the child's import census
+## Next highest-leverage milestone: cross archive indexing efficiently
 
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes,
 the NTDLL export census is resolved, and an unpacked child image is mapped near
@@ -113,12 +113,17 @@ Shell32, Advapi32, COMCTL32, Ole32, WinMM, IMM32, and Version import passes.
 Window-class registration, Guest window objects, WndProc callbacks, painting,
 the initial message queue, DIB transfer, and RGBA frame capture are modeled.
 The D3D9 and DirectSound modules now resolve, as does the absent optional
-`logprint.dll` probe family. The child enters its real bootstrap but currently
-returns into an already invalidated generated call block near `0x100a817b`.
-Trace the expected non-returning child-entry transition first. Once real D3D
-calls appear, build only the observed COM objects over `vnrt-gfx`; the wgpu
-backend already creates and uploads real Host GPU textures. Then connect the
-resulting swapchain image to an SDL3 native window.
+`logprint.dll` probe family. NT-like heap size-class slack preserves the
+packer's generated trampoline, directory handles work with backup semantics,
+and DOS `*.*` enumeration now exposes the dotless `pac` directory. The engine
+opens all 15 observed YPF archives; a one-billion-instruction run currently
+ends at its configured limit during archive indexing/decryption, without a
+compatibility exception.
+
+Profile and accelerate that hot path next. Once real D3D calls appear, build
+only the observed COM objects over `vnrt-gfx`; the wgpu backend already creates
+and uploads real Host GPU textures. Then connect the resulting swapchain image
+to an SDL3 native window.
 
 ## Following target milestone: complete target and first real window
 

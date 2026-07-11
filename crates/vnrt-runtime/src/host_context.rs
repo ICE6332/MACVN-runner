@@ -1138,6 +1138,10 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.process_io.open(path, readable, writable, disposition)
     }
 
+    fn open_directory_handle(&mut self, path: &str) -> Result<Handle, Win32Error> {
+        self.process_io.open_directory(path)
+    }
+
     fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error> {
         self.process_io.read(handle, length)
     }

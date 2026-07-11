@@ -2474,6 +2474,27 @@ impl HostCallHandler for CreateFile {
                 feature: "CreateFile flags",
             });
         }
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        if flags & FILE_FLAG_BACKUP_SEMANTICS != 0
+            && disposition == 3
+            && context
+                .file_attributes(&path)
+                .is_ok_and(|attributes| attributes & 0x10 != 0)
+        {
+            match context.open_directory_handle(&path) {
+                Ok(handle) => {
+                    debug!(path, handle = handle.0, "opened Guest directory");
+                    context.set_last_error(0);
+                    context.set_return_u32(handle.0);
+                }
+                Err(_) => {
+                    context.set_last_error(3); // ERROR_PATH_NOT_FOUND
+                    context.set_return_u32(INVALID_HANDLE_VALUE);
+                }
+            }
+            context.set_stdcall_cleanup(28);
+            return Ok(());
+        }
         match context.open_file(&path, readable, writable, disposition) {
             Ok((handle, existed)) => {
                 debug!(path, handle = handle.0, "opened Guest file");

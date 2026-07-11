@@ -1,5 +1,7 @@
 //! Sparse, page-based 32-bit guest virtual memory.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,6 +14,7 @@ const PAGE_TABLE_BITS: u32 = 10;
 const PAGE_TABLE_ENTRIES: usize = 1 << PAGE_TABLE_BITS;
 const PAGE_TABLE_MASK: u32 = (1 << PAGE_TABLE_BITS) - 1;
 const PAGE_DIRECTORY_SHIFT: u32 = 12 + PAGE_TABLE_BITS;
+const EXECUTABLE_WRITE_HISTORY_LIMIT: usize = 512;
 
 type PageTable = Box<[Option<Page>]>;
 
@@ -79,6 +82,19 @@ pub enum AccessKind {
     Execute,
 }
 
+/// One recent mutation of a page that was executable at write time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableWrite {
+    /// Guest instruction responsible for the write, when executed by the CPU.
+    pub source: Option<GuestAddress>,
+    /// First Guest byte modified by the write.
+    pub address: GuestAddress,
+    /// Complete write length before diagnostic truncation.
+    pub length: usize,
+    /// First bytes supplied by the writer, capped at 32 bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Guest memory mapping and access errors.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MemoryError {
@@ -136,6 +152,10 @@ impl Page {
 pub struct GuestMemory {
     page_directory: Box<[Option<PageTable>]>,
     next_generation: u64,
+    track_executable_writes: bool,
+    tracked_write_range: Option<(u32, u32)>,
+    write_origin: Option<GuestAddress>,
+    executable_writes: VecDeque<ExecutableWrite>,
 }
 
 impl Default for GuestMemory {
@@ -151,6 +171,10 @@ impl GuestMemory {
         Self {
             page_directory: empty_slots(),
             next_generation: 1,
+            track_executable_writes: false,
+            tracked_write_range: None,
+            write_origin: None,
+            executable_writes: VecDeque::new(),
         }
     }
 
@@ -272,6 +296,9 @@ impl GuestMemory {
     /// Write bytes, transparently crossing page boundaries.
     pub fn write(&mut self, address: GuestAddress, input: &[u8]) -> Result<(), MemoryError> {
         walk_chunks(address, input.len(), |guest, source_offset, chunk_len| {
+            let executable = self
+                .page(guest)
+                .is_some_and(|page| page.permissions.execute);
             let generation = self.fresh_generation();
             let page = self
                 .page_mut(guest)
@@ -286,8 +313,41 @@ impl GuestMemory {
             page.bytes[page_offset..page_offset + chunk_len]
                 .copy_from_slice(&input[source_offset..source_offset + chunk_len]);
             page.generation = generation;
+            if (self.track_executable_writes && executable)
+                || self.write_is_in_tracked_range(guest, chunk_len)
+            {
+                self.record_executable_write(
+                    guest,
+                    &input[source_offset..source_offset + chunk_len],
+                );
+            }
             Ok(())
         })
+    }
+
+    /// Enable or disable bounded diagnostics for writes to executable pages.
+    pub fn set_track_executable_writes(&mut self, enabled: bool) {
+        self.track_executable_writes = enabled;
+        if !enabled {
+            self.executable_writes.clear();
+        }
+    }
+
+    /// Track writes overlapping one half-open Guest address range.
+    pub fn set_tracked_write_range(&mut self, range: Option<(u32, u32)>) {
+        self.tracked_write_range = range;
+        self.executable_writes.clear();
+    }
+
+    /// Attribute subsequent memory writes to a Guest instruction.
+    pub fn set_write_origin(&mut self, origin: Option<GuestAddress>) {
+        self.write_origin = origin;
+    }
+
+    /// Recent executable-page writes in oldest-to-newest order.
+    #[must_use]
+    pub fn executable_writes(&self) -> &VecDeque<ExecutableWrite> {
+        &self.executable_writes
     }
 
     /// Read a little-endian 32-bit integer.
@@ -412,6 +472,9 @@ impl GuestMemory {
         input: &[u8],
     ) -> Result<(), MemoryError> {
         debug_assert!(address.page_offset() + input.len() <= PAGE_SIZE);
+        let executable = self
+            .page(address)
+            .is_some_and(|page| page.permissions.execute);
         let generation = self.fresh_generation();
         let page = self
             .page_mut(address)
@@ -425,7 +488,35 @@ impl GuestMemory {
         let offset = address.page_offset();
         page.bytes[offset..offset + input.len()].copy_from_slice(input);
         page.generation = generation;
+        if (self.track_executable_writes && executable)
+            || self.write_is_in_tracked_range(address, input.len())
+        {
+            self.record_executable_write(address, input);
+        }
         Ok(())
+    }
+
+    fn record_executable_write(&mut self, address: GuestAddress, input: &[u8]) {
+        if !self.track_executable_writes && self.tracked_write_range.is_none() {
+            return;
+        }
+        if self.executable_writes.len() == EXECUTABLE_WRITE_HISTORY_LIMIT {
+            self.executable_writes.pop_front();
+        }
+        self.executable_writes.push_back(ExecutableWrite {
+            source: self.write_origin,
+            address,
+            length: input.len(),
+            bytes: input.iter().copied().take(32).collect(),
+        });
+    }
+
+    fn write_is_in_tracked_range(&self, address: GuestAddress, length: usize) -> bool {
+        let Some((start, end)) = self.tracked_write_range else {
+            return false;
+        };
+        let write_end = u64::from(address.0).saturating_add(length as u64);
+        u64::from(address.0) < u64::from(end) && write_end > u64::from(start)
     }
 
     fn fresh_generation(&mut self) -> u64 {

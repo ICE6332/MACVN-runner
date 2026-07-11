@@ -97,12 +97,22 @@ Version imports. WinMM has real sandboxed MMIO file reads/seeks and RIFF chunk
 descent/ascent; unavailable audio devices and input methods remain explicit.
 The import census now also crosses D3D9 and DirectSound discovery, followed by
 the target's absent optional `logprint.dll` plugin (`Test`, `Test2`, and the same
-numbered cdecl probe family). The child then leaves the import-error path and
-enters its real bootstrap. Its current failure is a return into a transient
-generated-code block near `0x100a817b`; that block has already invalidated its
-own call site, so the next task is to identify the expected non-returning child
-entry transition rather than misclassifying the resulting bytes as an x86
-instruction.
+numbered cdecl probe family).
+
+The transient-code failure near `0x100a817b` was caused by a legacy packer that
+requested 16 bytes from the heap and wrote a 34-byte executable trampoline. The
+Guest heap now preserves requested-size accounting while placing tiny blocks in
+64-byte physical size classes, matching the slack expected from an NT heap.
+
+Two Win32 filesystem details then unlocked the real content path:
+
+- `CreateFile(..., FILE_FLAG_BACKUP_SEMANTICS)` can open the Guest root directory.
+- DOS `*.*` matches entries without a dot, so the engine now discovers `pac`.
+
+The target consequently enumerates all 15 local YPF archives and opens the
+script, image, voice, and update packs. A one-billion-instruction run now stops
+inside archive indexing/decryption rather than at a compatibility exception.
+No Guest D3D method has executed yet; CPU throughput is the immediate frontier.
 
 The Host graphics substrate now uses wgpu 30 and has been verified locally to
 select a real GPU, create an RGBA render-target texture, upload pixels, and

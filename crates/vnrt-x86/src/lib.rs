@@ -13,11 +13,25 @@ use iced_x86::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vnrt_memory::{GuestAddress, GuestMemory, MemoryError, PAGE_SIZE, PAGE_SIZE_U32};
+use vnrt_memory::{AccessKind, GuestAddress, GuestMemory, MemoryError, PAGE_SIZE, PAGE_SIZE_U32};
 
 /// Maximum length of one x86 instruction.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
 const CONTROL_TRANSFER_HISTORY_LIMIT: usize = 512;
+const INSTRUCTION_TRACE_LIMIT: usize = 256;
+
+/// One decoded instruction retained by an opt-in address-range trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracedInstruction {
+    /// Guest instruction address.
+    pub address: GuestAddress,
+    /// Decoder-selected instruction length.
+    pub length: usize,
+    /// Bytes visible when the instruction was about to execute.
+    pub bytes: Vec<u8>,
+    /// iced-x86 instruction debug representation.
+    pub instruction: String,
+}
 
 /// Kind of non-linear Guest control transfer retained for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +311,20 @@ pub enum CpuException {
         /// Architectural EIP reported in the exception context.
         resume_address: GuestAddress,
     },
+    /// The decoder rejected the byte stream at the current instruction pointer.
+    IllegalInstruction {
+        /// Address of the invalid instruction encoding.
+        address: GuestAddress,
+    },
+    /// An instruction fetch or operand access touched unavailable Guest memory.
+    AccessViolation {
+        /// Address of the instruction that attempted the access.
+        address: GuestAddress,
+        /// Guest virtual address rejected by memory translation.
+        memory_address: GuestAddress,
+        /// Windows exception access selector: 0 read, 1 write, or 8 execute.
+        access: u32,
+    },
 }
 
 /// CPU decode or execution errors.
@@ -397,6 +425,8 @@ pub struct Interpreter {
     block_cache: HashMap<u32, Arc<CachedBlock>>,
     block_hotness: HashMap<u32, u8>,
     recent_control_transfers: VecDeque<ControlTransfer>,
+    trace_range: Option<(u32, u32)>,
+    traced_instructions: VecDeque<TracedInstruction>,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +454,8 @@ impl Interpreter {
             block_cache: HashMap::new(),
             block_hotness: HashMap::new(),
             recent_control_transfers: VecDeque::with_capacity(CONTROL_TRANSFER_HISTORY_LIMIT),
+            trace_range: None,
+            traced_instructions: VecDeque::with_capacity(INSTRUCTION_TRACE_LIMIT),
         }
     }
 
@@ -431,6 +463,18 @@ impl Interpreter {
     #[must_use]
     pub fn recent_control_transfers(&self) -> Vec<ControlTransfer> {
         self.recent_control_transfers.iter().copied().collect()
+    }
+
+    /// Enable a bounded instruction trace for a half-open Guest address range.
+    pub fn set_trace_range(&mut self, range: Option<(u32, u32)>) {
+        self.trace_range = range;
+        self.traced_instructions.clear();
+    }
+
+    /// Instructions captured by the configured range in execution order.
+    #[must_use]
+    pub fn traced_instructions(&self) -> &VecDeque<TracedInstruction> {
+        &self.traced_instructions
     }
 
     /// Execute one instruction or report an external call boundary.
@@ -448,7 +492,22 @@ impl Interpreter {
             return Ok(StepOutcome::ExternalCall { address: eip });
         }
 
-        let instruction = self.decode_cached(memory, eip)?;
+        let instruction = match self.decode_cached(memory, eip) {
+            Ok(instruction) => instruction,
+            Err(CpuError::InvalidInstruction { address }) => {
+                return Ok(StepOutcome::Exception {
+                    exception: CpuException::IllegalInstruction {
+                        address: GuestAddress(address),
+                    },
+                });
+            }
+            Err(CpuError::Memory(error)) => {
+                return Ok(StepOutcome::Exception {
+                    exception: access_violation(eip, &error, 8),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if instruction.mnemonic() == Mnemonic::Int3 {
             let resume_address = GuestAddress(instruction.next_ip32());
             self.state.registers.eip = resume_address.0;
@@ -459,7 +518,18 @@ impl Interpreter {
                 },
             });
         }
-        self.execute(memory, &instruction)?;
+        self.record_traced_instruction(memory, &instruction)?;
+        memory.set_write_origin(Some(eip));
+        let execution = self.execute(memory, &instruction);
+        memory.set_write_origin(None);
+        if let Err(error) = execution {
+            if let CpuError::Memory(memory_error) = error {
+                return Ok(StepOutcome::Exception {
+                    exception: access_violation(eip, &memory_error, 0),
+                });
+            }
+            return Err(error);
+        }
         Ok(StepOutcome::Continue { instruction })
     }
 
@@ -482,7 +552,25 @@ impl Interpreter {
                     steps: steps + 1,
                 });
             }
-            let Some(block) = self.decode_block(memory, eip)? else {
+            let decoded_block = match self.decode_block(memory, eip) {
+                Ok(block) => block,
+                Err(CpuError::InvalidInstruction { address }) => {
+                    return Ok(BatchOutcome::Exception {
+                        exception: CpuException::IllegalInstruction {
+                            address: GuestAddress(address),
+                        },
+                        steps: steps + 1,
+                    });
+                }
+                Err(CpuError::Memory(error)) => {
+                    return Ok(BatchOutcome::Exception {
+                        exception: access_violation(eip, &error, 8),
+                        steps: steps + 1,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(block) = decoded_block else {
                 match self.step(memory, resolver)? {
                     StepOutcome::Continue { .. } => {
                         steps += 1;
@@ -521,7 +609,23 @@ impl Interpreter {
                         steps: steps + 1,
                     });
                 }
-                self.execute(memory, instruction)?;
+                self.record_traced_instruction(memory, instruction)?;
+                memory.set_write_origin(Some(GuestAddress(instruction.ip32())));
+                let execution = self.execute(memory, instruction);
+                memory.set_write_origin(None);
+                if let Err(error) = execution {
+                    if let CpuError::Memory(memory_error) = error {
+                        return Ok(BatchOutcome::Exception {
+                            exception: access_violation(
+                                GuestAddress(instruction.ip32()),
+                                &memory_error,
+                                0,
+                            ),
+                            steps: steps + 1,
+                        });
+                    }
+                    return Err(error);
+                }
                 steps += 1;
                 if !block_is_valid(memory, &block)? {
                     break;
@@ -575,6 +679,32 @@ impl Interpreter {
         }
         self.block_cache.insert(start.0, Arc::clone(&block));
         Ok(Some(block))
+    }
+
+    fn record_traced_instruction(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+    ) -> Result<(), CpuError> {
+        let Some((start, end)) = self.trace_range else {
+            return Ok(());
+        };
+        let address = instruction.ip32();
+        if address < start || address >= end {
+            return Ok(());
+        }
+        let mut bytes = vec![0; instruction.len()];
+        memory.fetch(GuestAddress(address), &mut bytes)?;
+        if self.traced_instructions.len() == INSTRUCTION_TRACE_LIMIT {
+            self.traced_instructions.pop_front();
+        }
+        self.traced_instructions.push_back(TracedInstruction {
+            address: GuestAddress(address),
+            length: instruction.len(),
+            bytes,
+            instruction: format!("{instruction:?}"),
+        });
+        Ok(())
     }
 
     fn decode_cached(
@@ -1905,6 +2035,32 @@ fn decode(memory: &GuestMemory, eip: GuestAddress) -> Result<Instruction, CpuErr
     Ok(instruction)
 }
 
+fn access_violation(
+    instruction: GuestAddress,
+    error: &MemoryError,
+    default_access: u32,
+) -> CpuException {
+    let memory_address = match error {
+        MemoryError::NotMapped { address }
+        | MemoryError::Protection { address, .. }
+        | MemoryError::AlreadyMapped { address } => *address,
+        MemoryError::AddressOverflow | MemoryError::Unsupported(_) => u32::MAX,
+    };
+    let access = match error {
+        MemoryError::Protection { access, .. } => match access {
+            AccessKind::Read => 0,
+            AccessKind::Write => 1,
+            AccessKind::Execute => 8,
+        },
+        _ => default_access,
+    };
+    CpuException::AccessViolation {
+        address: instruction,
+        memory_address: GuestAddress(memory_address),
+        access,
+    }
+}
+
 fn second_page_generation(
     memory: &GuestMemory,
     eip: GuestAddress,
@@ -2784,6 +2940,40 @@ mod tests {
             }
         );
         assert_eq!(cpu.state.registers.eip, 0x1001);
+    }
+
+    #[test]
+    fn reports_invalid_encoding_as_an_illegal_instruction_exception() {
+        // FF /5 requires a memory operand; the register encoding is invalid.
+        let (mut cpu, mut memory) = machine(&[0xff, 0xef]);
+        let outcome = cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(
+            outcome,
+            StepOutcome::Exception {
+                exception: CpuException::IllegalInstruction {
+                    address: GuestAddress(0x1000),
+                },
+            }
+        );
+        assert_eq!(cpu.state.registers.eip, 0x1000);
+    }
+
+    #[test]
+    fn reports_unmapped_operand_reads_as_access_violation_exceptions() {
+        // mov eax,dword ptr [5000h]
+        let (mut cpu, mut memory) = machine(&[0xa1, 0x00, 0x50, 0x00, 0x00]);
+        let outcome = cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(
+            outcome,
+            StepOutcome::Exception {
+                exception: CpuException::AccessViolation {
+                    address: GuestAddress(0x1000),
+                    memory_address: GuestAddress(0x5000),
+                    access: 0,
+                },
+            }
+        );
+        assert_eq!(cpu.state.registers.eip, 0x1000);
     }
 
     #[test]

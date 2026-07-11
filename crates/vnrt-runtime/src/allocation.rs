@@ -1,5 +1,7 @@
 use super::*;
 
+const HEAP_ALLOCATION_GRANULARITY: u32 = 64;
+
 #[derive(Debug, Default)]
 pub(super) struct GuestHeap {
     maximum_size: Option<u32>,
@@ -34,7 +36,11 @@ impl GuestHeapArena {
         requested_size: u32,
         executable: bool,
     ) -> Result<GuestAddress, Win32Error> {
-        let allocation_size = align_up(requested_size.max(1), 16).ok_or(Win32Error::OutOfMemory)?;
+        // Preserve requested sizes for HeapSize/accounting while separating
+        // physical blocks by an NT-heap-like size class. Some legacy packers
+        // deliberately place tiny executable stubs beyond their nominal size.
+        let allocation_size = align_up(requested_size.max(1), HEAP_ALLOCATION_GRANULARITY)
+            .ok_or(Win32Error::OutOfMemory)?;
         let address = GuestAddress(self.cursor);
         let end = self
             .cursor
@@ -359,5 +365,25 @@ impl GuestRegionAllocator {
         }
         self.allocations.remove(&address.0);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_heap_requests_keep_slack_and_report_requested_size() {
+        let mut memory = GuestMemory::new();
+        let mut heaps = GuestHeapManager::new();
+        let heap = Handle(PROCESS_HEAP_HANDLE);
+        let first = heaps
+            .allocate(&mut memory, heap, 16)
+            .expect("first allocation");
+        let second = heaps
+            .allocate(&mut memory, heap, 16)
+            .expect("second allocation");
+        assert_eq!(second.0 - first.0, HEAP_ALLOCATION_GRANULARITY);
+        assert_eq!(heaps.size(heap, first).expect("reported size"), 16);
     }
 }

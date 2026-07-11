@@ -3,6 +3,8 @@ use super::*;
 pub(super) const EXCEPTION_HANDLER_RETURN_ADDRESS: u32 = 0xffff_fff4;
 
 const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
+const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+const EXCEPTION_ACCESS_VIOLATION: u32 = 0xc000_0005;
 const EXCEPTION_RECORD_SIZE: u32 = 0x50;
 const CONTEXT_SIZE: u32 = 0x2cc;
 const CONTEXT_FLAGS: u32 = 0x0001_0007;
@@ -39,10 +41,22 @@ impl Runtime {
                 "nested processor exception during SEH dispatch",
             ));
         }
-        let (code, address) = match exception {
-            CpuException::Breakpoint { address, .. } => (EXCEPTION_BREAKPOINT, address),
+        let (code, address, information) = match exception {
+            CpuException::Breakpoint { address, .. } => (EXCEPTION_BREAKPOINT, address, Vec::new()),
+            CpuException::IllegalInstruction { address } => {
+                (EXCEPTION_ILLEGAL_INSTRUCTION, address, Vec::new())
+            }
+            CpuException::AccessViolation {
+                address,
+                memory_address,
+                access,
+            } => (
+                EXCEPTION_ACCESS_VIOLATION,
+                address,
+                vec![access, memory_address.0],
+            ),
         };
-        self.dispatch_guest_exception(code, 0, address, &[])
+        self.dispatch_guest_exception(code, 0, address, &information)
     }
 
     pub(super) fn dispatch_guest_exception(
