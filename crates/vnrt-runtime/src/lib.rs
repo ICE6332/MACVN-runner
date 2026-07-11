@@ -33,7 +33,8 @@ use vnrt_win32::{
     Win32Error,
 };
 use vnrt_x86::{
-    CpuError, CpuException, ExternalTargetResolver, Interpreter, Registers, StepOutcome,
+    BatchOutcome, CpuError, CpuException, ExternalTargetResolver, Interpreter, Registers,
+    StepOutcome,
 };
 
 /// External targets occupy a reserved, unmapped region near the top of the
@@ -449,6 +450,65 @@ impl Runtime {
 
     /// Run until termination or an explicit execution limit.
     pub fn run(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
+        if tracing::enabled!(target: "vnrt_runtime", tracing::Level::TRACE) {
+            return self.run_traced(limits);
+        }
+        self.run_batched(limits)
+    }
+
+    fn run_batched(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
+        let mut consumed = 0;
+        while consumed < limits.max_instructions {
+            if self.tls_callbacks_active
+                && self.cpu.state.registers.eip == TLS_CALLBACK_RETURN_ADDRESS
+            {
+                self.advance_tls_callbacks()?;
+                consumed += 1;
+                continue;
+            }
+            if self.cpu.state.registers.eip == HOST_CALLBACK_RETURN_ADDRESS {
+                self.advance_host_callbacks()?;
+                consumed += 1;
+                continue;
+            }
+            if self.cpu.state.registers.eip == EXCEPTION_HANDLER_RETURN_ADDRESS {
+                self.advance_exception_dispatch()?;
+                consumed += 1;
+                continue;
+            }
+            let resolver = ThunkResolver(&self.import_thunks);
+            match self.cpu.run_batch(
+                &mut self.memory,
+                &resolver,
+                limits.max_instructions - consumed,
+            )? {
+                BatchOutcome::BudgetExhausted { steps } => consumed += steps,
+                BatchOutcome::ExternalCall { address, steps } => {
+                    consumed += steps;
+                    if self.tls_callbacks_active && address.0 == TLS_CALLBACK_RETURN_ADDRESS {
+                        self.advance_tls_callbacks()?;
+                    } else if address.0 == HOST_CALLBACK_RETURN_ADDRESS {
+                        self.advance_host_callbacks()?;
+                    } else if address.0 == EXCEPTION_HANDLER_RETURN_ADDRESS {
+                        self.advance_exception_dispatch()?;
+                    } else {
+                        self.dispatch_host_call(address)?;
+                    }
+                }
+                BatchOutcome::Exception { exception, steps } => {
+                    consumed += steps;
+                    self.dispatch_cpu_exception(exception)?;
+                }
+                BatchOutcome::Halted { .. } => return Ok(RunOutcome::Halted),
+            }
+            if let Some(code) = self.exit_code {
+                return Ok(RunOutcome::Exited(code));
+            }
+        }
+        Err(RuntimeError::ExecutionLimit(limits.max_instructions))
+    }
+
+    fn run_traced(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
         for step_index in 0..limits.max_instructions {
             trace!(step_index, eip = self.cpu.state.registers.eip, "guest step");
             if self.tls_callbacks_active
@@ -664,5 +724,11 @@ struct ThunkResolver<'a>(&'a HashMap<GuestAddress, ApiKey>);
 impl ExternalTargetResolver for ThunkResolver<'_> {
     fn is_external_target(&self, address: GuestAddress) -> bool {
         self.0.contains_key(&address)
+            || matches!(
+                address.0,
+                TLS_CALLBACK_RETURN_ADDRESS
+                    | HOST_CALLBACK_RETURN_ADDRESS
+                    | EXCEPTION_HANDLER_RETURN_ADDRESS
+            )
     }
 }

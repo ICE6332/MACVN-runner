@@ -93,6 +93,9 @@ amount of compatibility surface, rather than broad Windows coverage.
   not fault merely because an allocation begins at a Host page boundary.
 - Execute target-observed `LEAVE`, `NOT`, `XCHG`, EFLAGS probing, x87 control
   state, and the minimal MMX `MOVD/PUNPCKLDQ/MOVQ/EMMS` sequence.
+- Replace per-access tree lookup with a sparse two-level page table, add
+  page-generation-validated instruction decoding, batch untraced execution,
+  and add safe single-page integer access fast paths.
 
 ## Next highest-leverage milestone: Chinese launcher section mapping
 

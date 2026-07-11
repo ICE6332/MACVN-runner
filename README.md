@@ -37,6 +37,7 @@ cargo check --workspace --all-features
 - `crates/vnrt-x86`: x86 interpreter
 - `crates/vnrt-*32`: target-driven Win32 API surfaces
 - `docs/NEXT_STEPS.md`: roadmap
+- `docs/INTERPRETER_OPTIMIZATION.md`: performance design and unsafe policy
 - `docs/TARGET_EUPHORIA.md`: HD comparison-target notes
 - `docs/TARGET_EUPHORIA_CN.md`: primary Chinese target notes
 

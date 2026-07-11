@@ -3,12 +3,14 @@
 //! This crate depends only on guest memory. In particular, it has no knowledge
 //! of Win32 modules, handles, or APIs.
 
+use std::collections::HashMap;
+
 use iced_x86::{
     Code, Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vnrt_memory::{GuestAddress, GuestMemory, MemoryError};
+use vnrt_memory::{GuestAddress, GuestMemory, MemoryError, PAGE_SIZE, PAGE_SIZE_U32};
 
 /// Maximum length of one x86 instruction.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
@@ -30,6 +32,7 @@ pub const FLAG_OF: u32 = 1 << 11;
 
 const ARITHMETIC_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
 const LOGIC_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_ZF | FLAG_SF | FLAG_OF;
+const MAX_DECODE_CACHE_ENTRIES: usize = 1 << 20;
 
 /// Architectural integer registers used by the initial interpreter.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,6 +222,35 @@ pub enum StepOutcome {
     Halted,
 }
 
+/// Result of executing consecutive instructions until a Runtime boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// The complete requested instruction budget was consumed.
+    BudgetExhausted {
+        /// Guest steps consumed by the batch.
+        steps: u64,
+    },
+    /// Control reached a host-owned thunk.
+    ExternalCall {
+        /// Host thunk address.
+        address: GuestAddress,
+        /// Guest steps consumed including the boundary transition.
+        steps: u64,
+    },
+    /// Guest execution raised a synchronous processor exception.
+    Exception {
+        /// Exception reported to the outer runtime.
+        exception: CpuException,
+        /// Guest steps consumed including the faulting instruction.
+        steps: u64,
+    },
+    /// Execution reached the halted state.
+    Halted {
+        /// Guest steps consumed including the halt observation.
+        steps: u64,
+    },
+}
+
 /// Synchronous processor exceptions that require operating-system dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuException {
@@ -325,6 +357,14 @@ impl OperandWidth {
 pub struct Interpreter {
     /// Architectural state exposed to the runtime and debugger.
     pub state: CpuState,
+    instruction_cache: HashMap<u32, CachedInstruction>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedInstruction {
+    instruction: Instruction,
+    first_page_generation: u64,
+    second_page_generation: Option<u64>,
 }
 
 impl Interpreter {
@@ -333,7 +373,10 @@ impl Interpreter {
     pub fn new(entry_point: GuestAddress) -> Self {
         let mut state = CpuState::default();
         state.registers.eip = entry_point.0;
-        Self { state }
+        Self {
+            state,
+            instruction_cache: HashMap::new(),
+        }
     }
 
     /// Execute one instruction or report an external call boundary.
@@ -351,7 +394,7 @@ impl Interpreter {
             return Ok(StepOutcome::ExternalCall { address: eip });
         }
 
-        let instruction = decode(memory, eip)?;
+        let instruction = self.decode_cached(memory, eip)?;
         if instruction.mnemonic() == Mnemonic::Int3 {
             let resume_address = GuestAddress(instruction.next_ip32());
             self.state.registers.eip = resume_address.0;
@@ -364,6 +407,65 @@ impl Interpreter {
         }
         self.execute(memory, &instruction)?;
         Ok(StepOutcome::Continue { instruction })
+    }
+
+    /// Execute until a Host/exception/halt boundary or `max_steps` is consumed.
+    pub fn run_batch(
+        &mut self,
+        memory: &mut GuestMemory,
+        resolver: &impl ExternalTargetResolver,
+        max_steps: u64,
+    ) -> Result<BatchOutcome, CpuError> {
+        let mut steps = 0;
+        while steps < max_steps {
+            match self.step(memory, resolver)? {
+                StepOutcome::Continue { .. } => steps += 1,
+                StepOutcome::ExternalCall { address } => {
+                    return Ok(BatchOutcome::ExternalCall {
+                        address,
+                        steps: steps + 1,
+                    });
+                }
+                StepOutcome::Exception { exception } => {
+                    return Ok(BatchOutcome::Exception {
+                        exception,
+                        steps: steps + 1,
+                    });
+                }
+                StepOutcome::Halted => return Ok(BatchOutcome::Halted { steps: steps + 1 }),
+            }
+        }
+        Ok(BatchOutcome::BudgetExhausted { steps })
+    }
+
+    fn decode_cached(
+        &mut self,
+        memory: &GuestMemory,
+        eip: GuestAddress,
+    ) -> Result<Instruction, CpuError> {
+        let first_page_generation = memory.executable_page_generation(eip)?;
+        if let Some(cached) = self.instruction_cache.get(&eip.0)
+            && cached.first_page_generation == first_page_generation
+            && second_page_generation(memory, eip, cached.instruction.len())?
+                == cached.second_page_generation
+        {
+            return Ok(cached.instruction);
+        }
+
+        let instruction = decode(memory, eip)?;
+        let second_page_generation = second_page_generation(memory, eip, instruction.len())?;
+        if self.instruction_cache.len() >= MAX_DECODE_CACHE_ENTRIES {
+            self.instruction_cache.clear();
+        }
+        self.instruction_cache.insert(
+            eip.0,
+            CachedInstruction {
+                instruction,
+                first_page_generation,
+                second_page_generation,
+            },
+        );
+        Ok(instruction)
     }
 
     fn execute(
@@ -1434,6 +1536,26 @@ fn decode(memory: &GuestMemory, eip: GuestAddress) -> Result<Instruction, CpuErr
     Ok(instruction)
 }
 
+fn second_page_generation(
+    memory: &GuestMemory,
+    eip: GuestAddress,
+    instruction_len: usize,
+) -> Result<Option<u64>, CpuError> {
+    if eip.page_offset() + instruction_len <= PAGE_SIZE {
+        return Ok(None);
+    }
+    let next_page = eip
+        .page_base()
+        .0
+        .checked_add(PAGE_SIZE_U32)
+        .map(GuestAddress)
+        .ok_or(MemoryError::AddressOverflow)?;
+    memory
+        .executable_page_generation(next_page)
+        .map(Some)
+        .map_err(Into::into)
+}
+
 fn unsupported_operand(instruction: &Instruction, detail: &str) -> CpuError {
     CpuError::UnsupportedOperand {
         address: instruction.ip32(),
@@ -2156,6 +2278,20 @@ mod tests {
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         assert_eq!(cpu.state.registers.eax, 0x1234_5678);
         assert_eq!(cpu.state.registers.esi, 0x2028);
+    }
+
+    #[test]
+    fn decode_cache_observes_self_modifying_code() {
+        let (mut cpu, mut memory) = machine(&[0xb8, 1, 0, 0, 0]);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.eax, 1);
+
+        memory
+            .write(GuestAddress(0x1001), &2_u32.to_le_bytes())
+            .unwrap();
+        cpu.state.registers.eip = 0x1000;
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.eax, 2);
     }
 
     #[test]
