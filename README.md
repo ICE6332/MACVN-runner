@@ -39,6 +39,8 @@ cargo check --workspace --all-features
 - `docs/NEXT_STEPS.md`: roadmap
 - `docs/INTERPRETER_OPTIMIZATION.md`: performance design and unsafe policy
 - `docs/TARGET_EUPHORIA.md`: HD comparison-target notes
+- `docs/TARGET_EUPHORIA.zh-CN.md`: HD comparison-target notes (Chinese)
 - `docs/TARGET_EUPHORIA_CN.md`: primary Chinese target notes
+- `docs/TARGET_EUPHORIA_CN.zh-CN.md`: primary Chinese target notes (Chinese)
 
 Licensed under MIT or Apache-2.0.
