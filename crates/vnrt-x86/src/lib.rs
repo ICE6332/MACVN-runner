@@ -3,7 +3,7 @@
 //! This crate depends only on guest memory. In particular, it has no knowledge
 //! of Win32 modules, handles, or APIs.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use iced_x86::{
     Code, Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register,
@@ -33,6 +33,8 @@ pub const FLAG_OF: u32 = 1 << 11;
 const ARITHMETIC_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
 const LOGIC_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_ZF | FLAG_SF | FLAG_OF;
 const MAX_DECODE_CACHE_ENTRIES: usize = 1 << 20;
+const MAX_BLOCK_CACHE_ENTRIES: usize = 1 << 18;
+const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 /// Architectural integer registers used by the initial interpreter.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -358,6 +360,7 @@ pub struct Interpreter {
     /// Architectural state exposed to the runtime and debugger.
     pub state: CpuState,
     instruction_cache: HashMap<u32, CachedInstruction>,
+    block_cache: HashMap<u32, Arc<CachedBlock>>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +368,12 @@ struct CachedInstruction {
     instruction: Instruction,
     first_page_generation: u64,
     second_page_generation: Option<u64>,
+}
+
+#[derive(Debug)]
+struct CachedBlock {
+    instructions: Vec<Instruction>,
+    page_generations: Vec<(GuestAddress, u64)>,
 }
 
 impl Interpreter {
@@ -376,6 +385,7 @@ impl Interpreter {
         Self {
             state,
             instruction_cache: HashMap::new(),
+            block_cache: HashMap::new(),
         }
     }
 
@@ -418,24 +428,77 @@ impl Interpreter {
     ) -> Result<BatchOutcome, CpuError> {
         let mut steps = 0;
         while steps < max_steps {
-            match self.step(memory, resolver)? {
-                StepOutcome::Continue { .. } => steps += 1,
-                StepOutcome::ExternalCall { address } => {
-                    return Ok(BatchOutcome::ExternalCall {
-                        address,
-                        steps: steps + 1,
-                    });
+            if self.state.halted {
+                return Ok(BatchOutcome::Halted { steps: steps + 1 });
+            }
+            let eip = GuestAddress(self.state.registers.eip);
+            if resolver.is_external_target(eip) {
+                return Ok(BatchOutcome::ExternalCall {
+                    address: eip,
+                    steps: steps + 1,
+                });
+            }
+            let block = self.decode_block(memory, eip)?;
+            for instruction in &block.instructions {
+                if steps >= max_steps || instruction.ip32() != self.state.registers.eip {
+                    break;
                 }
-                StepOutcome::Exception { exception } => {
+                if instruction.mnemonic() == Mnemonic::Int3 {
+                    let address = GuestAddress(instruction.ip32());
+                    let resume_address = GuestAddress(instruction.next_ip32());
+                    self.state.registers.eip = resume_address.0;
                     return Ok(BatchOutcome::Exception {
-                        exception,
+                        exception: CpuException::Breakpoint {
+                            address,
+                            resume_address,
+                        },
                         steps: steps + 1,
                     });
                 }
-                StepOutcome::Halted => return Ok(BatchOutcome::Halted { steps: steps + 1 }),
+                self.execute(memory, instruction)?;
+                steps += 1;
+                if !block_is_valid(memory, &block)? {
+                    break;
+                }
             }
         }
         Ok(BatchOutcome::BudgetExhausted { steps })
+    }
+
+    fn decode_block(
+        &mut self,
+        memory: &GuestMemory,
+        start: GuestAddress,
+    ) -> Result<Arc<CachedBlock>, CpuError> {
+        if let Some(block) = self.block_cache.get(&start.0).cloned()
+            && block_is_valid(memory, &block)?
+        {
+            return Ok(block);
+        }
+
+        let mut instructions = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
+        let mut page_generations = Vec::new();
+        let mut address = start;
+        for _ in 0..MAX_BLOCK_INSTRUCTIONS {
+            record_code_pages(memory, address, 1, &mut page_generations)?;
+            let instruction = self.decode_cached(memory, address)?;
+            record_code_pages(memory, address, instruction.len(), &mut page_generations)?;
+            let terminal = is_block_terminal(&instruction);
+            address = GuestAddress(instruction.next_ip32());
+            instructions.push(instruction);
+            if terminal {
+                break;
+            }
+        }
+        let block = Arc::new(CachedBlock {
+            instructions,
+            page_generations,
+        });
+        if self.block_cache.len() >= MAX_BLOCK_CACHE_ENTRIES {
+            self.block_cache.clear();
+        }
+        self.block_cache.insert(start.0, Arc::clone(&block));
+        Ok(block)
     }
 
     fn decode_cached(
@@ -1556,6 +1619,46 @@ fn second_page_generation(
         .map_err(Into::into)
 }
 
+fn block_is_valid(memory: &GuestMemory, block: &CachedBlock) -> Result<bool, CpuError> {
+    for (page, generation) in &block.page_generations {
+        if memory.executable_page_generation(*page)? != *generation {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn record_code_pages(
+    memory: &GuestMemory,
+    address: GuestAddress,
+    instruction_len: usize,
+    generations: &mut Vec<(GuestAddress, u64)>,
+) -> Result<(), CpuError> {
+    let first = address.page_base();
+    if !generations.iter().any(|(page, _)| *page == first) {
+        generations.push((first, memory.executable_page_generation(first)?));
+    }
+    if address.page_offset() + instruction_len > PAGE_SIZE {
+        let second = first
+            .0
+            .checked_add(PAGE_SIZE_U32)
+            .map(GuestAddress)
+            .ok_or(MemoryError::AddressOverflow)?;
+        if !generations.iter().any(|(page, _)| *page == second) {
+            generations.push((second, memory.executable_page_generation(second)?));
+        }
+    }
+    Ok(())
+}
+
+fn is_block_terminal(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.mnemonic(),
+        Mnemonic::Call | Mnemonic::Ret | Mnemonic::Jmp | Mnemonic::Hlt | Mnemonic::Int3
+    ) || is_conditional_jump(instruction.mnemonic())
+        || is_string_mnemonic(instruction.mnemonic())
+}
+
 fn unsupported_operand(instruction: &Instruction, detail: &str) -> CpuError {
     CpuError::UnsupportedOperand {
         address: instruction.ip32(),
@@ -2291,6 +2394,19 @@ mod tests {
             .unwrap();
         cpu.state.registers.eip = 0x1000;
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.eax, 2);
+    }
+
+    #[test]
+    fn block_cache_stops_before_modified_following_instruction() {
+        let code = [
+            0xc6, 0x05, 0x08, 0x10, 0x00, 0x00, 0x02, // mov byte ptr [1008h], 2
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xf4, // hlt
+        ];
+        let (mut cpu, mut memory) = machine(&code);
+        let outcome = cpu.run_batch(&mut memory, &NoExternalTargets, 16).unwrap();
+        assert!(matches!(outcome, BatchOutcome::Halted { .. }));
         assert_eq!(cpu.state.registers.eax, 2);
     }
 
