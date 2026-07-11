@@ -75,9 +75,17 @@ rebuild the ANSI/UTF-16 process blocks and update the PEB, while pointer probes,
 string helpers, file/directory removal, and system-directory queries cover the
 remaining observed Kernel32 imports.
 
-The child has now crossed the Kernel32 import census and entered `user32.dll`.
-It has resolved window-text, cursor, and client/screen coordinate helpers; the
-current observed unresolved import is `SetClassLongA`. No real User32 window has
-been created yet, but the active frontier is now the window-class and window
-creation layer rather than the unpacker or interpreter core. The HD executable
+The child has now crossed the Kernel32 import census and is deep into
+`user32.dll`. The runtime now keeps real process-local window classes and atoms,
+Guest WndProc pointers, window objects, titles, styles, placement, visibility,
+enabled state, menus, regions, cursor position, and display mode. `CreateWindowEx`
+constructs a Guest `CREATESTRUCT` and dispatches `WM_NCCREATE`/`WM_CREATE` to the
+registered WndProc.
+
+The initial thread also has a modeled message queue covering post, peek, get,
+translate, dispatch, and quit messages. Default-window processing, paint
+requests, display enumeration, clipboard handles, icon/menu lifetime, and the
+common geometry APIs are in place. The current observed unresolved import is
+`RedrawWindow`. No native SDL3 window has been created yet, but the Guest-side
+window/message substrate needed to drive one now exists. The HD executable
 remains useful as a comparison path but is not the primary target.

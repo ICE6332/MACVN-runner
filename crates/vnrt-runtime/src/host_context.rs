@@ -16,6 +16,27 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) com_initialization_count: &'a mut u32,
     pub(super) cursor_display_count: &'a mut i32,
     pub(super) focused_window: &'a mut u32,
+    pub(super) window_class_longs: &'a mut HashMap<(u32, i32), u32>,
+    pub(super) icons: &'a mut BTreeSet<u32>,
+    pub(super) next_icon_handle: &'a mut u32,
+    pub(super) window_classes: &'a mut HashMap<String, (u16, GuestAddress)>,
+    pub(super) next_window_class_atom: &'a mut u16,
+    pub(super) window_regions: &'a mut HashMap<u32, u32>,
+    pub(super) windows: &'a mut HashMap<u32, String>,
+    pub(super) window_titles: &'a mut HashMap<u32, String>,
+    pub(super) visible_windows: &'a mut BTreeSet<u32>,
+    pub(super) window_placements: &'a mut HashMap<u32, Vec<u8>>,
+    pub(super) disabled_windows: &'a mut BTreeSet<u32>,
+    pub(super) thread_messages: &'a mut VecDeque<(u32, u32, u32, u32)>,
+    pub(super) primary_display_size: &'a mut (u32, u32),
+    pub(super) menus: &'a mut BTreeSet<u32>,
+    pub(super) next_menu_handle: &'a mut u32,
+    pub(super) cursor_position: &'a mut (i32, i32),
+    pub(super) window_menus: &'a mut HashMap<u32, u32>,
+    pub(super) clipboard_open: &'a mut bool,
+    pub(super) clipboard_data: &'a mut HashMap<u32, u32>,
+    pub(super) window_longs: &'a mut HashMap<(u32, i32), u32>,
+    pub(super) next_window_handle: &'a mut u32,
     pub(super) image_base: GuestAddress,
     pub(super) resource_directory: Option<(GuestAddress, u32)>,
     pub(super) virtual_memory: &'a mut GuestRegionAllocator,
@@ -133,6 +154,292 @@ impl HostCallContext for RuntimeHostContext<'_> {
 
     fn replace_focus_window(&mut self, window: u32) -> u32 {
         std::mem::replace(self.focused_window, window)
+    }
+
+    fn replace_window_class_long(&mut self, window: u32, index: i32, value: u32) -> u32 {
+        self.window_class_longs
+            .insert((window, index), value)
+            .unwrap_or(0)
+    }
+
+    fn window_class_long(&self, window: u32, index: i32) -> u32 {
+        self.window_class_longs
+            .get(&(window, index))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn create_icon(&mut self) -> u32 {
+        let handle = *self.next_icon_handle;
+        *self.next_icon_handle = self.next_icon_handle.wrapping_add(4);
+        self.icons.insert(handle);
+        handle
+    }
+
+    fn destroy_icon(&mut self, icon: u32) -> bool {
+        self.icons.remove(&icon)
+    }
+
+    fn register_window_class(&mut self, name: &str, callback: GuestAddress) -> Option<u16> {
+        let key = name.to_ascii_lowercase();
+        if self.window_classes.contains_key(&key) {
+            return None;
+        }
+        let atom = *self.next_window_class_atom;
+        *self.next_window_class_atom = self.next_window_class_atom.wrapping_add(1).max(0xc000);
+        self.window_classes.insert(key, (atom, callback));
+        Some(atom)
+    }
+
+    fn window_class_callback_by_name(&self, name: &str) -> Option<GuestAddress> {
+        self.window_classes
+            .get(&name.to_ascii_lowercase())
+            .map(|(_, callback)| *callback)
+    }
+
+    fn window_class_callback_by_atom(&self, atom: u16) -> Option<GuestAddress> {
+        self.window_classes
+            .values()
+            .find_map(|(candidate, callback)| (*candidate == atom).then_some(*callback))
+    }
+
+    fn window_class_name_by_atom(&self, atom: u16) -> Option<String> {
+        self.window_classes
+            .iter()
+            .find_map(|(name, (candidate, _))| (*candidate == atom).then(|| name.clone()))
+    }
+
+    fn create_window(&mut self, class_name: &str, title: &str, visible: bool) -> u32 {
+        let handle = *self.next_window_handle;
+        *self.next_window_handle = self.next_window_handle.wrapping_add(4);
+        self.windows.insert(handle, class_name.to_owned());
+        self.window_titles.insert(handle, title.to_owned());
+        if visible {
+            self.visible_windows.insert(handle);
+        }
+        handle
+    }
+
+    fn window_class_name(&self, window: u32) -> Option<String> {
+        self.windows.get(&window).cloned()
+    }
+
+    fn window_title(&self, window: u32) -> Option<String> {
+        self.window_titles.get(&window).cloned()
+    }
+
+    fn set_window_title(&mut self, window: u32, title: &str) -> bool {
+        if !self.windows.contains_key(&window) {
+            return false;
+        }
+        self.window_titles.insert(window, title.to_owned());
+        true
+    }
+
+    fn remove_window(&mut self, window: u32) -> bool {
+        self.window_regions.remove(&window);
+        self.window_titles.remove(&window);
+        self.window_menus.remove(&window);
+        self.visible_windows.remove(&window);
+        self.window_placements.remove(&window);
+        self.disabled_windows.remove(&window);
+        self.window_class_longs
+            .retain(|(hwnd, _), _| *hwnd != window);
+        self.window_longs.retain(|(hwnd, _), _| *hwnd != window);
+        self.guest_callback_targets.remove(&window);
+        self.windows.remove(&window).is_some()
+    }
+
+    fn is_window(&self, window: u32) -> bool {
+        self.windows.contains_key(&window)
+    }
+
+    fn is_window_visible(&self, window: u32) -> bool {
+        self.visible_windows.contains(&window)
+    }
+
+    fn set_window_visible(&mut self, window: u32, visible: bool) -> bool {
+        let previous = self.visible_windows.contains(&window);
+        if self.windows.contains_key(&window) {
+            if visible {
+                self.visible_windows.insert(window);
+            } else {
+                self.visible_windows.remove(&window);
+            }
+        }
+        previous
+    }
+
+    fn set_window_placement(&mut self, window: u32, placement: &[u8]) -> bool {
+        if !self.windows.contains_key(&window) {
+            return false;
+        }
+        self.window_placements.insert(window, placement.to_vec());
+        true
+    }
+
+    fn window_placement(&self, window: u32) -> Option<Vec<u8>> {
+        if !self.windows.contains_key(&window) {
+            return None;
+        }
+        Some(
+            self.window_placements
+                .get(&window)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut placement = vec![0; 44];
+                    placement[0..4].copy_from_slice(&44_u32.to_le_bytes());
+                    placement[8..12].copy_from_slice(&1_u32.to_le_bytes());
+                    placement
+                }),
+        )
+    }
+
+    fn set_window_enabled(&mut self, window: u32, enabled: bool) -> bool {
+        let previous =
+            self.windows.contains_key(&window) && !self.disabled_windows.contains(&window);
+        if self.windows.contains_key(&window) {
+            if enabled {
+                self.disabled_windows.remove(&window);
+            } else {
+                self.disabled_windows.insert(window);
+            }
+        }
+        previous
+    }
+
+    fn is_window_enabled(&self, window: u32) -> bool {
+        self.windows.contains_key(&window) && !self.disabled_windows.contains(&window)
+    }
+
+    fn post_thread_message(&mut self, window: u32, message: u32, wparam: u32, lparam: u32) {
+        self.thread_messages
+            .push_back((window, message, wparam, lparam));
+    }
+
+    fn next_thread_message(
+        &mut self,
+        remove: bool,
+        minimum: u32,
+        maximum: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let matches = |message: u32| {
+            message == 0x0012
+                || (minimum == 0 && maximum == 0)
+                || (minimum <= message && message <= maximum)
+        };
+        let index = self
+            .thread_messages
+            .iter()
+            .position(|(_, message, _, _)| matches(*message))?;
+        if remove {
+            self.thread_messages.remove(index)
+        } else {
+            self.thread_messages.get(index).copied()
+        }
+    }
+
+    fn primary_display_size(&self) -> (u32, u32) {
+        *self.primary_display_size
+    }
+
+    fn set_primary_display_size(&mut self, width: u32, height: u32) {
+        *self.primary_display_size = (width, height);
+    }
+
+    fn create_menu(&mut self) -> u32 {
+        let handle = *self.next_menu_handle;
+        *self.next_menu_handle = self.next_menu_handle.wrapping_add(4);
+        self.menus.insert(handle);
+        handle
+    }
+
+    fn destroy_menu(&mut self, menu: u32) -> bool {
+        self.menus.remove(&menu)
+    }
+
+    fn is_menu(&self, menu: u32) -> bool {
+        self.menus.contains(&menu)
+    }
+
+    fn window_handles(&self) -> Vec<u32> {
+        self.windows.keys().copied().collect()
+    }
+
+    fn cursor_position(&self) -> (i32, i32) {
+        *self.cursor_position
+    }
+
+    fn set_cursor_position(&mut self, x: i32, y: i32) {
+        *self.cursor_position = (x, y);
+    }
+
+    fn set_window_menu(&mut self, window: u32, menu: u32) -> bool {
+        if !self.windows.contains_key(&window) {
+            return false;
+        }
+        if menu == 0 {
+            self.window_menus.remove(&window);
+        } else {
+            self.window_menus.insert(window, menu);
+        }
+        true
+    }
+
+    fn window_menu(&self, window: u32) -> Option<u32> {
+        self.window_menus.get(&window).copied()
+    }
+
+    fn set_clipboard_open(&mut self, open: bool) -> bool {
+        if *self.clipboard_open == open {
+            return false;
+        }
+        *self.clipboard_open = open;
+        true
+    }
+
+    fn clear_clipboard(&mut self) {
+        self.clipboard_data.clear();
+    }
+
+    fn clipboard_data(&self, format: u32) -> Option<u32> {
+        self.clipboard_data.get(&format).copied()
+    }
+
+    fn set_clipboard_data(&mut self, format: u32, handle: u32) {
+        self.clipboard_data.insert(format, handle);
+    }
+
+    fn replace_window_long(&mut self, window: u32, index: i32, value: u32) -> Option<u32> {
+        if !self.windows.contains_key(&window) {
+            return None;
+        }
+        if index == -4 {
+            self.guest_callback_targets
+                .insert(window, GuestAddress(value));
+        }
+        Some(
+            self.window_longs
+                .insert((window, index), value)
+                .unwrap_or(0),
+        )
+    }
+
+    fn window_long(&self, window: u32, index: i32) -> Option<u32> {
+        self.windows.contains_key(&window).then(|| {
+            self.window_longs
+                .get(&(window, index))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    fn set_window_region(&mut self, window: u32, region: u32) {
+        if region == 0 {
+            self.window_regions.remove(&window);
+        } else {
+            self.window_regions.insert(window, region);
+        }
     }
 
     fn read_memory(&self, address: GuestAddress, output: &mut [u8]) -> Result<(), Win32Error> {

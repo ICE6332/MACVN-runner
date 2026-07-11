@@ -780,6 +780,89 @@ pub trait HostCallContext {
     fn guest_callback_target(&self, object: u32) -> Option<GuestAddress>;
     /// Replace the focused Guest window and return the previous handle.
     fn replace_focus_window(&mut self, window: u32) -> u32;
+    /// Replace one 32-bit window-class attribute and return its previous value.
+    fn replace_window_class_long(&mut self, window: u32, index: i32, value: u32) -> u32;
+    /// Read one previously modeled 32-bit window-class attribute.
+    fn window_class_long(&self, window: u32, index: i32) -> u32;
+    /// Allocate an opaque Guest icon object.
+    fn create_icon(&mut self) -> u32;
+    /// Destroy a process-owned Guest icon object.
+    fn destroy_icon(&mut self, icon: u32) -> bool;
+    /// Register a named Guest window class and return its process-local atom.
+    fn register_window_class(&mut self, name: &str, callback: GuestAddress) -> Option<u16>;
+    /// Resolve a registered window class callback by name.
+    fn window_class_callback_by_name(&self, name: &str) -> Option<GuestAddress>;
+    /// Resolve a registered window class callback by atom.
+    fn window_class_callback_by_atom(&self, atom: u16) -> Option<GuestAddress>;
+    /// Resolve a registered window class name by atom.
+    fn window_class_name_by_atom(&self, atom: u16) -> Option<String>;
+    /// Allocate a Guest window record and return its opaque handle.
+    fn create_window(&mut self, class_name: &str, title: &str, visible: bool) -> u32;
+    /// Return the registered class name for a Guest window.
+    fn window_class_name(&self, window: u32) -> Option<String>;
+    /// Return the current title of a Guest window.
+    fn window_title(&self, window: u32) -> Option<String>;
+    /// Replace the title of a Guest window, returning whether it exists.
+    fn set_window_title(&mut self, window: u32, title: &str) -> bool;
+    /// Remove a Guest window record.
+    fn remove_window(&mut self, window: u32) -> bool;
+    /// Whether a Guest window handle is currently alive.
+    fn is_window(&self, window: u32) -> bool;
+    /// Query the modeled visibility of a Guest window.
+    fn is_window_visible(&self, window: u32) -> bool;
+    /// Change a Guest window's visibility and return its previous state.
+    fn set_window_visible(&mut self, window: u32, visible: bool) -> bool;
+    /// Store a 32-bit WINDOWPLACEMENT record for a Guest window.
+    fn set_window_placement(&mut self, window: u32, placement: &[u8]) -> bool;
+    /// Read the last 32-bit WINDOWPLACEMENT record for a Guest window.
+    fn window_placement(&self, window: u32) -> Option<Vec<u8>>;
+    /// Change a Guest window's enabled state and return its previous state.
+    fn set_window_enabled(&mut self, window: u32, enabled: bool) -> bool;
+    /// Query whether a Guest window is enabled.
+    fn is_window_enabled(&self, window: u32) -> bool;
+    /// Post one message to the initial Guest thread's queue.
+    fn post_thread_message(&mut self, window: u32, message: u32, wparam: u32, lparam: u32);
+    /// Peek or remove the first queued message matching the requested range.
+    fn next_thread_message(
+        &mut self,
+        remove: bool,
+        minimum: u32,
+        maximum: u32,
+    ) -> Option<(u32, u32, u32, u32)>;
+    /// Return the logical primary display size exposed to the Guest.
+    fn primary_display_size(&self) -> (u32, u32);
+    /// Change the logical primary display mode.
+    fn set_primary_display_size(&mut self, width: u32, height: u32);
+    /// Allocate a process-owned Guest menu object.
+    fn create_menu(&mut self) -> u32;
+    /// Destroy a process-owned Guest menu object.
+    fn destroy_menu(&mut self, menu: u32) -> bool;
+    /// Whether a handle identifies a process-owned Guest menu.
+    fn is_menu(&self, menu: u32) -> bool;
+    /// Snapshot all live top-level Guest window handles.
+    fn window_handles(&self) -> Vec<u32>;
+    /// Return the logical screen-space cursor position.
+    fn cursor_position(&self) -> (i32, i32);
+    /// Change the logical screen-space cursor position.
+    fn set_cursor_position(&mut self, x: i32, y: i32);
+    /// Attach or clear a menu on a Guest window.
+    fn set_window_menu(&mut self, window: u32, menu: u32) -> bool;
+    /// Return the menu attached to a Guest window.
+    fn window_menu(&self, window: u32) -> Option<u32>;
+    /// Open or close the process clipboard model.
+    fn set_clipboard_open(&mut self, open: bool) -> bool;
+    /// Clear all modeled clipboard formats.
+    fn clear_clipboard(&mut self);
+    /// Read a clipboard data handle for one format.
+    fn clipboard_data(&self, format: u32) -> Option<u32>;
+    /// Store a clipboard data handle for one format.
+    fn set_clipboard_data(&mut self, format: u32, handle: u32);
+    /// Replace one 32-bit per-window attribute and return its previous value.
+    fn replace_window_long(&mut self, window: u32, index: i32, value: u32) -> Option<u32>;
+    /// Read one 32-bit per-window attribute.
+    fn window_long(&self, window: u32, index: i32) -> Option<u32>;
+    /// Attach an owned region handle to a Guest window.
+    fn set_window_region(&mut self, window: u32, region: u32);
     /// Read guest bytes for string and structure arguments.
     fn read_memory(&self, address: GuestAddress, output: &mut [u8]) -> Result<(), Win32Error>;
     /// Write guest output data.
