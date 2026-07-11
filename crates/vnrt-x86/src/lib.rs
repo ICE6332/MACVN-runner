@@ -361,6 +361,7 @@ pub struct Interpreter {
     pub state: CpuState,
     instruction_cache: HashMap<u32, CachedInstruction>,
     block_cache: HashMap<u32, Arc<CachedBlock>>,
+    block_hotness: HashMap<u32, u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +387,7 @@ impl Interpreter {
             state,
             instruction_cache: HashMap::new(),
             block_cache: HashMap::new(),
+            block_hotness: HashMap::new(),
         }
     }
 
@@ -438,7 +440,29 @@ impl Interpreter {
                     steps: steps + 1,
                 });
             }
-            let block = self.decode_block(memory, eip)?;
+            let Some(block) = self.decode_block(memory, eip)? else {
+                match self.step(memory, resolver)? {
+                    StepOutcome::Continue { .. } => {
+                        steps += 1;
+                        continue;
+                    }
+                    StepOutcome::ExternalCall { address } => {
+                        return Ok(BatchOutcome::ExternalCall {
+                            address,
+                            steps: steps + 1,
+                        });
+                    }
+                    StepOutcome::Exception { exception } => {
+                        return Ok(BatchOutcome::Exception {
+                            exception,
+                            steps: steps + 1,
+                        });
+                    }
+                    StepOutcome::Halted => {
+                        return Ok(BatchOutcome::Halted { steps: steps + 1 });
+                    }
+                }
+            };
             for instruction in &block.instructions {
                 if steps >= max_steps || instruction.ip32() != self.state.registers.eip {
                     break;
@@ -469,11 +493,20 @@ impl Interpreter {
         &mut self,
         memory: &GuestMemory,
         start: GuestAddress,
-    ) -> Result<Arc<CachedBlock>, CpuError> {
+    ) -> Result<Option<Arc<CachedBlock>>, CpuError> {
         if let Some(block) = self.block_cache.get(&start.0).cloned()
             && block_is_valid(memory, &block)?
         {
-            return Ok(block);
+            return Ok(Some(block));
+        }
+        if self.block_cache.remove(&start.0).is_some() {
+            self.block_hotness.remove(&start.0);
+            return Ok(None);
+        }
+        let hotness = self.block_hotness.entry(start.0).or_default();
+        *hotness = hotness.saturating_add(1);
+        if *hotness < 2 {
+            return Ok(None);
         }
 
         let mut instructions = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
@@ -496,9 +529,10 @@ impl Interpreter {
         });
         if self.block_cache.len() >= MAX_BLOCK_CACHE_ENTRIES {
             self.block_cache.clear();
+            self.block_hotness.clear();
         }
         self.block_cache.insert(start.0, Arc::clone(&block));
-        Ok(block)
+        Ok(Some(block))
     }
 
     fn decode_cached(
