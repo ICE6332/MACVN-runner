@@ -556,6 +556,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vnrt-psapi"
+version = "0.1.0"
+dependencies = [
+ "vnrt-win32",
+]
+
+[[package]]
 name = "vnrt-runner"
 version = "0.1.0"
 dependencies = [
@@ -569,6 +576,7 @@ dependencies = [
  "vnrt-kernel32",
  "vnrt-ntdll",
  "vnrt-ole32",
+ "vnrt-psapi",
  "vnrt-runtime",
  "vnrt-shell32",
  "vnrt-user32",

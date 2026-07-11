@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use vnrt_runtime::{RunLimits, RunOutcome, Runtime, RuntimeConfig};
+use vnrt_runtime::{DiagnosticSnapshot, RunLimits, RunOutcome, Runtime, RuntimeConfig};
 use vnrt_win32::{ApiRegistry, GuestAddress};
 
 #[derive(Debug, Parser)]
@@ -39,6 +39,7 @@ fn main() -> Result<ExitCode> {
     vnrt_kernel32::register(&mut registry);
     vnrt_ntdll::register(&mut registry);
     vnrt_ole32::register(&mut registry);
+    vnrt_psapi::register(&mut registry);
     vnrt_shell32::register(&mut registry);
     vnrt_user32::register(&mut registry);
     vnrt_winmm::register(&mut registry);
@@ -75,6 +76,9 @@ fn main() -> Result<ExitCode> {
                 stack_pointer_previews = ?stack_pointer_previews(&runtime, &snapshot.stack_words),
                 exception_chain = ?snapshot.exception_chain,
                 recent_host_calls = ?snapshot.recent_host_calls,
+                recent_control_transfers = ?snapshot.recent_control_transfers.iter().rev().take(32).collect::<Vec<_>>(),
+                control_transfer_previews = ?control_transfer_previews(&runtime, &snapshot),
+                matching_stack_transfers = ?matching_stack_transfers(&runtime, &snapshot),
                 "guest execution failed"
             );
             emit_guest_output(&runtime)?;
@@ -118,6 +122,61 @@ fn stack_pointer_previews(runtime: &Runtime, words: &[u32]) -> Vec<(u32, String)
             let utf16 = String::from_utf16(&utf16).unwrap_or_default();
             (!ascii.is_empty() || !utf16.is_empty())
                 .then(|| (address, format!("ascii={ascii:?}, utf16={utf16:?}")))
+        })
+        .collect()
+}
+
+fn control_transfer_previews(runtime: &Runtime, snapshot: &DiagnosticSnapshot) -> Vec<String> {
+    snapshot
+        .recent_control_transfers
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|transfer| {
+            let start = transfer.source.saturating_sub(16);
+            let mut code = [0_u8; 40];
+            let code = runtime
+                .memory
+                .read(GuestAddress(start), &mut code)
+                .map_or_else(|_| "<unmapped>".to_owned(), |_| format_bytes(&code));
+            let stack = (0..4_u32)
+                .filter_map(|index| {
+                    transfer
+                        .stack_pointer
+                        .checked_add(index * 4)
+                        .and_then(|address| runtime.memory.read_u32(GuestAddress(address)).ok())
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "{:?} {:#010x}->{:#010x} esp={:#010x} code@{:#010x}=[{}] stack={stack:?}",
+                transfer.kind,
+                transfer.source,
+                transfer.target,
+                transfer.stack_pointer,
+                start,
+                code,
+            )
+        })
+        .collect()
+}
+
+fn matching_stack_transfers(runtime: &Runtime, snapshot: &DiagnosticSnapshot) -> Vec<String> {
+    snapshot
+        .recent_control_transfers
+        .iter()
+        .filter(|transfer| transfer.stack_pointer == snapshot.registers.esp)
+        .map(|transfer| {
+            let start = transfer.source.saturating_sub(12);
+            let mut code = [0_u8; 32];
+            let code = runtime
+                .memory
+                .read(GuestAddress(start), &mut code)
+                .map_or_else(|_| "<unmapped>".to_owned(), |_| format_bytes(&code));
+            format!(
+                "{:?} {:#010x}->{:#010x} code@{:#010x}=[{}]",
+                transfer.kind, transfer.source, transfer.target, start, code
+            )
         })
         .collect()
 }

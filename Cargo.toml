@@ -8,6 +8,7 @@ members = [
     "crates/vnrt-win32",
     "crates/vnrt-kernel32",
     "crates/vnrt-advapi32",
+    "crates/vnrt-psapi",
     "crates/vnrt-user32",
     "crates/vnrt-shell32",
     "crates/vnrt-ole32",

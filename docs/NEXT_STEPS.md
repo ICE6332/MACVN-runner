@@ -96,25 +96,33 @@ amount of compatibility surface, rather than broad Windows coverage.
 - Replace per-access tree lookup with a sparse two-level page table, add
   page-generation-validated instruction decoding, batch untraced execution,
   and add safe single-page integer access fast paths.
+- Cache decoded instructions and promote only repeatedly executed basic blocks;
+  preserve page-generation invalidation for self-modifying unpacker code.
+- Execute the target-observed x87 load/arithmetic/store sequence and `LOOP`
+  control flow, while retaining a bounded control-transfer history for failures.
+- Model `psapi.dll!GetModuleBaseNameA/W` and continue the unpacked child's
+  Kernel32 export census through filesystem, time, locale, process, mapping,
+  and initial thread probes.
 
-## Next highest-leverage milestone: Chinese launcher section mapping
+## Next highest-leverage milestone: finish the child's import census
 
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes,
 the NTDLL export census is resolved, and an unpacked child image is mapped near
-`0x70100000`. Diagnose the current invalid indirect target (`0x00000002`), then
-continue the child's executed import and engine initialization path toward the
-first User32 window call.
+`0x70100000`. The invalid indirect-target failure has been traced and removed.
+Continue from the current `GetTimeZoneInformation` export probe until the child
+finishes Kernel32 resolution and enters engine initialization.
 
 ## Following target milestone: complete target and first real window
 
-Generic Host-to-Guest callback continuation, nested synchronous callbacks, and
-the real `DialogBoxParamA`/`EndDialog` path are implemented. The selected local
-target is currently incomplete: `system/YSCom/YSCom.exe` is required by engine
-initialization but absent from the available package and all YPF archives.
+The import census has exposed thread and file-mapping APIs. Their current
+facades distinguish export availability from runtime support, but real calls
+must gain proper object lifetime and Guest scheduling semantics.
 
-1. Supply the matching `system/YSCom/YSCom.exe` from a complete installation.
-2. Rerun the target and grow the User32 surface only from executed failures.
-3. Continue until `CreateWindowExA`, then attach the first SDL3 native window.
+1. Finish target-driven Kernel32 resolution without broad speculative coverage.
+2. Implement cooperative Guest thread contexts if `CreateThread` is actually
+   invoked, including stacks, TLS, suspend counts, exit codes, and waits.
+3. Grow the User32 surface only from executed failures until `CreateWindowExA`,
+   then attach the first SDL3 native window.
 
 ## Following low-level milestones
 

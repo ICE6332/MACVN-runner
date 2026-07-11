@@ -167,6 +167,14 @@ impl Runtime {
         let stack = self.cpu.state.registers.esp;
         self.memory
             .write_u32(GuestAddress(stack), EXCEPTION_HANDLER_RETURN_ADDRESS)?;
+        debug!(
+            handler = handler.0,
+            record = pending.record.0,
+            registration = pending.registration.0,
+            context = pending.context.0,
+            callback_frame = stack,
+            "entered Guest exception handler"
+        );
         Ok(())
     }
 

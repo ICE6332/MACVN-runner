@@ -20,6 +20,7 @@ vnrt-gdi32 = { path = "../../crates/vnrt-gdi32" }
 vnrt-kernel32 = { path = "../../crates/vnrt-kernel32" }
 vnrt-ntdll = { path = "../../crates/vnrt-ntdll" }
 vnrt-ole32 = { path = "../../crates/vnrt-ole32" }
+vnrt-psapi = { path = "../../crates/vnrt-psapi" }
 vnrt-runtime = { path = "../../crates/vnrt-runtime" }
 vnrt-shell32 = { path = "../../crates/vnrt-shell32" }
 vnrt-user32 = { path = "../../crates/vnrt-user32" }

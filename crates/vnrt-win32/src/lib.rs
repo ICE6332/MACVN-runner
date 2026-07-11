@@ -119,8 +119,21 @@ pub trait VirtualFileSystem: Send + Sync {
     fn read(&self, path: &str) -> Result<Vec<u8>, Win32Error>;
     /// Replace a guest-visible file.
     fn write(&self, path: &str, bytes: &[u8]) -> Result<(), Win32Error>;
+    /// Create one directory below the configured Guest root.
+    fn create_directory(&self, path: &str) -> Result<(), Win32Error>;
+    /// Query metadata for one existing guest-visible path.
+    fn metadata(&self, path: &str) -> Result<FileMetadata, Win32Error>;
     /// Enumerate entries matching one guest-relative wildcard pattern.
     fn list(&self, pattern: &str) -> Result<Vec<FileEntry>, Win32Error>;
+}
+
+/// Metadata for one guest-visible filesystem path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMetadata {
+    /// Exact byte size for regular files.
+    pub size: u64,
+    /// Whether the path refers to a directory.
+    pub is_directory: bool,
 }
 
 /// Metadata returned by the VFS directory enumeration boundary.
@@ -148,6 +161,18 @@ impl VirtualFileSystem for UnsupportedFileSystem {
     fn write(&self, _path: &str, _bytes: &[u8]) -> Result<(), Win32Error> {
         Err(Win32Error::Unsupported {
             feature: "virtual filesystem writes",
+        })
+    }
+
+    fn create_directory(&self, _path: &str) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem directory creation",
+        })
+    }
+
+    fn metadata(&self, _path: &str) -> Result<FileMetadata, Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem metadata",
         })
     }
 
@@ -281,6 +306,28 @@ impl VirtualFileSystem for SandboxFileSystem {
         })
     }
 
+    fn create_directory(&self, path: &str) -> Result<(), Win32Error> {
+        let resolved = self.resolve(path)?;
+        fs::create_dir(&resolved).map_err(|error| Win32Error::Io {
+            operation: "create directory",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn metadata(&self, path: &str) -> Result<FileMetadata, Win32Error> {
+        let resolved = self.resolve_existing(path)?;
+        let metadata = fs::metadata(&resolved).map_err(|error| Win32Error::Io {
+            operation: "metadata",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+        Ok(FileMetadata {
+            size: metadata.len(),
+            is_directory: metadata.is_dir(),
+        })
+    }
+
     fn list(&self, pattern: &str) -> Result<Vec<FileEntry>, Win32Error> {
         let normalized = self.relative_guest_path(pattern)?;
         let (directory, wildcard) = normalized
@@ -406,6 +453,17 @@ impl ProcessIo {
         let bytes = file.bytes[file.cursor..end].to_vec();
         file.cursor = end;
         Ok(bytes)
+    }
+
+    /// Create one Guest directory within the configured filesystem root.
+    pub fn create_directory(&self, path: &str) -> Result<(), Win32Error> {
+        self.filesystem.create_directory(path)
+    }
+
+    /// Return Win32 file attributes for one Guest path.
+    pub fn file_attributes(&self, path: &str) -> Result<u32, Win32Error> {
+        let metadata = self.filesystem.metadata(path)?;
+        Ok(if metadata.is_directory { 0x10 } else { 0x20 })
     }
 
     /// Close a file handle.
@@ -643,6 +701,8 @@ pub trait HostCallContext {
     fn free_virtual_memory(&mut self, address: GuestAddress) -> Result<(), Win32Error>;
     /// Look up a loaded Host module by normalized DLL name.
     fn loaded_module_handle(&self, name: &str) -> Option<GuestAddress>;
+    /// Resolve a loaded Host module handle back to its normalized DLL name.
+    fn loaded_module_name(&self, module: GuestAddress) -> Option<String>;
     /// Resolve a named export and return an executable Host thunk address.
     fn resolve_host_api(
         &mut self,
@@ -659,12 +719,18 @@ pub trait HostCallContext {
     fn last_error(&self) -> u32;
     /// Replace the current thread's simplified Win32 last-error value.
     fn set_last_error(&mut self, value: u32);
+    /// Replace the process error-mode flags and return the previous value.
+    fn replace_process_error_mode(&mut self, mode: u32) -> u32;
     /// Open a VFS path for sequential reading.
     fn open_file_read(&mut self, path: &str) -> Result<Handle, Win32Error>;
     /// Read bytes from an open file and advance its cursor.
     fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error>;
     /// Close an open file handle.
     fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Create one directory inside the configured Guest filesystem root.
+    fn create_directory(&mut self, path: &str) -> Result<(), Win32Error>;
+    /// Return Win32 file-attribute flags for one guest-visible path.
+    fn file_attributes(&self, path: &str) -> Result<u32, Win32Error>;
     /// Close a file or synchronization-object handle.
     fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error>;
     /// Open a token handle for the current process pseudo handle.

@@ -24,6 +24,10 @@ const INVALID_HANDLE_VALUE: u32 = u32::MAX;
 /// Register the current `kernel32.dll` surface.
 pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "ExitProcess"), ExitProcess);
+    registry.register(ApiKey::new(MODULE, "TerminateProcess"), TerminateProcess);
+    registry.register(ApiKey::new(MODULE, "ResumeThread"), ResumeThread);
+    registry.register(ApiKey::new(MODULE, "CreateThread"), CreateThread);
+    registry.register(ApiKey::new(MODULE, "ExitThread"), ExitThread);
     registry.register(ApiKey::new(MODULE, "GetTickCount"), GetTickCount);
     registry.register(ApiKey::new(MODULE, "GetStartupInfoA"), GetStartupInfo);
     registry.register(ApiKey::new(MODULE, "GetStartupInfoW"), GetStartupInfo);
@@ -48,6 +52,7 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "GetSystemTimeAsFileTime"),
         GetSystemTimeAsFileTime,
     );
+    registry.register(ApiKey::new(MODULE, "GetLocalTime"), GetLocalTime);
     registry.register(ApiKey::new(MODULE, "GetProcessHeap"), GetProcessHeap);
     registry.register(ApiKey::new(MODULE, "HeapCreate"), HeapCreate);
     registry.register(ApiKey::new(MODULE, "HeapDestroy"), HeapDestroy);
@@ -284,6 +289,30 @@ pub fn register(registry: &mut ApiRegistry) {
         GetThreadPreferredUiLanguages,
     );
     registry.register(
+        ApiKey::new(MODULE, "GlobalMemoryStatus"),
+        GlobalMemoryStatus,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "SetThreadIdealProcessor"),
+        SetThreadIdealProcessor,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetExitCodeProcess"),
+        GetExitCodeProcess,
+    );
+    registry.register(ApiKey::new(MODULE, "MapViewOfFile"), MapViewOfFile);
+    registry.register(ApiKey::new(MODULE, "UnmapViewOfFile"), UnmapViewOfFile);
+    registry.register(ApiKey::new(MODULE, "CreateFileMappingA"), CreateFileMapping);
+    registry.register(ApiKey::new(MODULE, "CreateFileMappingW"), CreateFileMapping);
+    registry.register(
+        ApiKey::new(MODULE, "GetSystemDefaultLangID"),
+        GetSystemDefaultLangId,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetUserDefaultLangID"),
+        GetSystemDefaultLangId,
+    );
+    registry.register(
         ApiKey::new(MODULE, "GetFullPathNameA"),
         GetFullPathName { wide: false },
     );
@@ -292,6 +321,23 @@ pub fn register(registry: &mut ApiRegistry) {
         GetFullPathName { wide: true },
     );
     registry.register(ApiKey::new(MODULE, "GetFileTime"), GetFileTime);
+    registry.register(
+        ApiKey::new(MODULE, "GetFileAttributesA"),
+        GetFileAttributes { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetFileAttributesW"),
+        GetFileAttributes { wide: true },
+    );
+    registry.register(ApiKey::new(MODULE, "SetErrorMode"), SetErrorMode);
+    registry.register(
+        ApiKey::new(MODULE, "CreateDirectoryA"),
+        CreateDirectory { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "CreateDirectoryW"),
+        CreateDirectory { wide: true },
+    );
     registry.register(
         ApiKey::new(MODULE, "OutputDebugStringA"),
         OutputDebugString { wide: false },
@@ -320,6 +366,71 @@ pub fn register(registry: &mut ApiRegistry) {
 
 #[derive(Debug, Clone, Copy)]
 struct ExitProcess;
+
+#[derive(Debug, Clone, Copy)]
+struct TerminateProcess;
+
+#[derive(Debug, Clone, Copy)]
+struct ResumeThread;
+
+#[derive(Debug, Clone, Copy)]
+struct CreateThread;
+
+#[derive(Debug, Clone, Copy)]
+struct ExitThread;
+
+impl HostCallHandler for ExitThread {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let exit_code = context.argument_u32(0)?;
+        // Until multiple Guest contexts exist, the initial thread owns the
+        // process and exiting it terminates the runtime.
+        context.request_exit(exit_code);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for CreateThread {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        // Export probing must not confuse "missing API" with "threading not
+        // initialized". Actual Guest thread creation remains a scheduler-level
+        // feature and is reported explicitly when invoked.
+        context.set_last_error(50); // ERROR_NOT_SUPPORTED
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(24);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for ResumeThread {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let thread = context.argument_u32(0)?;
+        if thread != u32::MAX - 1 {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(u32::MAX);
+        } else {
+            context.set_last_error(0);
+            context.set_return_u32(0); // previous suspend count
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for TerminateProcess {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let process = context.argument_u32(0)?;
+        let exit_code = context.argument_u32(1)?;
+        if process != u32::MAX {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(0);
+            context.set_stdcall_cleanup(8);
+        } else {
+            context.set_return_u32(1);
+            context.request_exit(exit_code);
+        }
+        Ok(())
+    }
+}
 
 impl HostCallHandler for ExitProcess {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -479,6 +590,9 @@ impl HostCallHandler for QueryPerformance {
 #[derive(Debug, Clone, Copy)]
 struct GetSystemTimeAsFileTime;
 
+#[derive(Debug, Clone, Copy)]
+struct GetLocalTime;
+
 impl HostCallHandler for GetSystemTimeAsFileTime {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let output = GuestAddress(context.argument_u32(0)?);
@@ -486,6 +600,53 @@ impl HostCallHandler for GetSystemTimeAsFileTime {
         context.set_stdcall_cleanup(4);
         Ok(())
     }
+}
+
+impl HostCallHandler for GetLocalTime {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        const WINDOWS_TO_UNIX_SECONDS: i64 = 11_644_473_600;
+        let output = GuestAddress(context.argument_u32(0)?);
+        let ticks = context.system_time_filetime();
+        let unix_millis = i64::try_from(ticks / 10_000)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(WINDOWS_TO_UNIX_SECONDS * 1_000);
+        let unix_seconds = unix_millis.div_euclid(1_000);
+        let days = unix_seconds.div_euclid(86_400);
+        let seconds = unix_seconds.rem_euclid(86_400);
+        let (year, month, day) = civil_date_from_unix_days(days);
+        let fields = [
+            year as u16,
+            month as u16,
+            (days + 4).rem_euclid(7) as u16,
+            day as u16,
+            (seconds / 3_600) as u16,
+            ((seconds / 60) % 60) as u16,
+            (seconds % 60) as u16,
+            unix_millis.rem_euclid(1_000) as u16,
+        ];
+        let mut bytes = [0_u8; 16];
+        for (chunk, value) in bytes.chunks_exact_mut(2).zip(fields) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        context.write_memory(output, &bytes)?;
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_phase = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
+    let month = month_phase + if month_phase < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2270,12 +2431,216 @@ struct CurrentPseudoHandle {
 struct GetThreadPreferredUiLanguages;
 
 #[derive(Debug, Clone, Copy)]
+struct GlobalMemoryStatus;
+
+#[derive(Debug, Clone, Copy)]
+struct SetThreadIdealProcessor;
+
+#[derive(Debug, Clone, Copy)]
+struct GetExitCodeProcess;
+
+#[derive(Debug, Clone, Copy)]
+struct MapViewOfFile;
+
+#[derive(Debug, Clone, Copy)]
+struct UnmapViewOfFile;
+
+#[derive(Debug, Clone, Copy)]
+struct CreateFileMapping;
+
+#[derive(Debug, Clone, Copy)]
+struct GetSystemDefaultLangId;
+
+impl HostCallHandler for GetSystemDefaultLangId {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_return_u32(0x0411); // Japanese, consistent with CP932
+        context.set_stdcall_cleanup(0);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for CreateFileMapping {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_last_error(50); // ERROR_NOT_SUPPORTED
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(24);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for UnmapViewOfFile {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_last_error(50); // ERROR_NOT_SUPPORTED
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for MapViewOfFile {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        // The current target probes this export but does not yet create file
+        // mapping objects. Advertise the API and fail safely until that object
+        // lifetime is needed by an observed call path.
+        context.set_last_error(50); // ERROR_NOT_SUPPORTED
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(20);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetExitCodeProcess {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let process = context.argument_u32(0)?;
+        let output = GuestAddress(context.argument_u32(1)?);
+        if process != u32::MAX {
+            context.set_last_error(6); // ERROR_INVALID_HANDLE
+            context.set_return_u32(0);
+        } else {
+            context.write_memory(output, &259_u32.to_le_bytes())?; // STILL_ACTIVE
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetThreadIdealProcessor {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let thread = context.argument_u32(0)?;
+        let processor = context.argument_u32(1)?;
+        if thread != u32::MAX - 1 || processor >= 32 {
+            context.set_last_error(87); // ERROR_INVALID_PARAMETER
+            context.set_return_u32(u32::MAX);
+        } else {
+            context.set_last_error(0);
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GlobalMemoryStatus {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let output = GuestAddress(context.argument_u32(0)?);
+        // MEMORYSTATUS uses seven DWORD values after dwLength. Keep the
+        // synthetic 32-bit machine internally consistent and below its 2 GiB
+        // user-address ceiling.
+        let values = [
+            32_u32,
+            50,
+            0x8000_0000,
+            0x4000_0000,
+            0xffff_ffff,
+            0x8000_0000,
+            0x7fff_0000,
+            0x4000_0000,
+        ];
+        let mut bytes = [0_u8; 32];
+        for (chunk, value) in bytes.chunks_exact_mut(4).zip(values) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        context.write_memory(output, &bytes)?;
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct GetFullPathName {
     wide: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct GetFileTime;
+
+#[derive(Debug, Clone, Copy)]
+struct GetFileAttributes {
+    wide: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SetErrorMode;
+
+#[derive(Debug, Clone, Copy)]
+struct CreateDirectory {
+    wide: bool,
+}
+
+impl HostCallHandler for GetFileAttributes {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let path_address = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, path_address)?
+        } else {
+            read_ansi_z(context, path_address)?
+        };
+        match context.file_attributes(&path) {
+            Ok(attributes) => {
+                context.set_last_error(0);
+                context.set_return_u32(attributes);
+            }
+            Err(_) => {
+                context.set_last_error(2); // ERROR_FILE_NOT_FOUND
+                context.set_return_u32(u32::MAX); // INVALID_FILE_ATTRIBUTES
+            }
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for CreateDirectory {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let path_address = GuestAddress(context.argument_u32(0)?);
+        let path = if self.wide {
+            read_utf16_z(context, path_address)?
+        } else {
+            read_ansi_z(context, path_address)?
+        };
+        let security = GuestAddress(context.argument_u32(1)?);
+        if security.0 != 0 {
+            let mut attributes = [0_u8; 12];
+            context.read_memory(security, &mut attributes)?;
+            if u32::from_le_bytes(
+                attributes[0..4]
+                    .try_into()
+                    .map_err(|_| Win32Error::InvalidArgument("SECURITY_ATTRIBUTES size"))?,
+            ) != 12
+            {
+                return Err(Win32Error::InvalidArgument(
+                    "CreateDirectory SECURITY_ATTRIBUTES length",
+                ));
+            }
+        }
+        if context.create_directory(&path).is_ok() {
+            context.set_last_error(0);
+            context.set_return_u32(1);
+        } else {
+            context.set_last_error(183); // ERROR_ALREADY_EXISTS or path failure
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetErrorMode {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let mode = context.argument_u32(0)?;
+        if mode & !0x8007 != 0 {
+            return Err(Win32Error::Unsupported {
+                feature: "SetErrorMode flags",
+            });
+        }
+        let previous = context.replace_process_error_mode(mode);
+        context.set_return_u32(previous);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct OutputDebugString {
@@ -2999,6 +3364,10 @@ mod tests {
         register(&mut registry);
         for name in [
             "ExitProcess",
+            "TerminateProcess",
+            "ResumeThread",
+            "CreateThread",
+            "ExitThread",
             "SetUnhandledExceptionFilter",
             "UnhandledExceptionFilter",
             "LoadLibraryA",
@@ -3014,9 +3383,23 @@ mod tests {
             "GetCurrentProcess",
             "GetCurrentThread",
             "GetThreadPreferredUILanguages",
+            "GlobalMemoryStatus",
+            "SetThreadIdealProcessor",
+            "GetExitCodeProcess",
+            "MapViewOfFile",
+            "UnmapViewOfFile",
+            "CreateFileMappingA",
+            "CreateFileMappingW",
+            "GetSystemDefaultLangID",
+            "GetUserDefaultLangID",
             "GetFullPathNameA",
             "GetFullPathNameW",
             "GetFileTime",
+            "GetFileAttributesA",
+            "GetFileAttributesW",
+            "SetErrorMode",
+            "CreateDirectoryA",
+            "CreateDirectoryW",
             "OutputDebugStringA",
             "OutputDebugStringW",
             "GetShortPathNameA",

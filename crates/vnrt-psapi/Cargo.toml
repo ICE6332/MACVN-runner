@@ -1,0 +1,12 @@
+[package]
+name = "vnrt-psapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vnrt-win32 = { path = "../vnrt-win32" }
+
+[lints]
+workspace = true

@@ -50,8 +50,18 @@ The executed compatibility path now includes:
 - Target-executed x87 integer loads/stores, float loads/stores, stack behavior,
   and multiply/add operations.
 
-The current frontier is a bad indirect Guest control target (`0x00000002`) after
-the first x87-heavy main-program path. The next diagnostic should retain recent
-indirect `CALL`/`JMP`/`RET` origins so the value can be traced to its producer.
-The HD executable remains useful as a comparison path but is not the primary
-target.
+The invalid `0x00000002` control target was a secondary SEH symptom. Retained
+`CALL`/`JMP`/`RET` history exposed the actual missing `SetErrorMode` export, and
+the loader now reports unresolved imports through its own `Import Error` dialog
+path. A modeled `psapi.dll` supplies `GetModuleBaseNameA/W` for that diagnostic.
+
+The Kernel32 export census has since crossed directory creation, file
+attributes, memory status, local time, process status, locale, file-mapping
+probes, and the initial thread API family. File-mapping and `CreateThread`
+facades currently fail with `ERROR_NOT_SUPPORTED` if they are actually invoked;
+full mapping-object lifetime and multi-context Guest scheduling remain explicit
+mainline work rather than silent fake success.
+
+The current observed unresolved import is `GetTimeZoneInformation`. No real
+User32 window has been created yet. The HD executable remains useful as a
+comparison path but is not the primary target.

@@ -3,7 +3,10 @@
 //! This crate depends only on guest memory. In particular, it has no knowledge
 //! of Win32 modules, handles, or APIs.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use iced_x86::{
     Code, Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register,
@@ -14,6 +17,31 @@ use vnrt_memory::{GuestAddress, GuestMemory, MemoryError, PAGE_SIZE, PAGE_SIZE_U
 
 /// Maximum length of one x86 instruction.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
+const CONTROL_TRANSFER_HISTORY_LIMIT: usize = 512;
+
+/// Kind of non-linear Guest control transfer retained for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlTransferKind {
+    /// Indirect subroutine call.
+    Call,
+    /// Indirect jump.
+    Jump,
+    /// Return through a stack-supplied address.
+    Return,
+}
+
+/// One recently executed call, indirect jump, or return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlTransfer {
+    /// Instruction address that performed the transfer.
+    pub source: u32,
+    /// Resolved destination address.
+    pub target: u32,
+    /// Stack pointer before the transfer modified it.
+    pub stack_pointer: u32,
+    /// Transfer operation.
+    pub kind: ControlTransferKind,
+}
 
 /// Carry flag.
 pub const FLAG_CF: u32 = 1 << 0;
@@ -368,6 +396,7 @@ pub struct Interpreter {
     instruction_cache: HashMap<u32, CachedInstruction>,
     block_cache: HashMap<u32, Arc<CachedBlock>>,
     block_hotness: HashMap<u32, u8>,
+    recent_control_transfers: VecDeque<ControlTransfer>,
 }
 
 #[derive(Debug, Clone)]
@@ -394,7 +423,14 @@ impl Interpreter {
             instruction_cache: HashMap::new(),
             block_cache: HashMap::new(),
             block_hotness: HashMap::new(),
+            recent_control_transfers: VecDeque::with_capacity(CONTROL_TRANSFER_HISTORY_LIMIT),
         }
+    }
+
+    /// Snapshot recently executed calls, indirect jumps, and returns.
+    #[must_use]
+    pub fn recent_control_transfers(&self) -> Vec<ControlTransfer> {
+        self.recent_control_transfers.iter().copied().collect()
     }
 
     /// Execute one instruction or report an external call boundary.
@@ -803,10 +839,17 @@ impl Interpreter {
             Mnemonic::Leave => self.execute_leave(memory, instruction)?,
             Mnemonic::Call => {
                 let target = self.read_branch_target(memory, instruction, 0)?;
+                self.record_control_transfer(
+                    instruction.ip32(),
+                    target,
+                    self.state.registers.esp,
+                    ControlTransferKind::Call,
+                );
                 self.push(memory, next_ip)?;
                 self.state.registers.eip = target;
             }
             Mnemonic::Ret => {
+                let stack_pointer = self.state.registers.esp;
                 let target = self.pop(memory)?;
                 let cleanup = if instruction.op_count() == 0 {
                     0
@@ -814,10 +857,33 @@ impl Interpreter {
                     self.read_operand(memory, instruction, 0)?
                 };
                 self.state.registers.esp = self.state.registers.esp.wrapping_add(cleanup);
+                self.record_control_transfer(
+                    instruction.ip32(),
+                    target,
+                    stack_pointer,
+                    ControlTransferKind::Return,
+                );
                 self.state.registers.eip = target;
             }
             Mnemonic::Jmp => {
-                self.state.registers.eip = self.read_branch_target(memory, instruction, 0)?;
+                let target = self.read_branch_target(memory, instruction, 0)?;
+                if matches!(instruction.op_kind(0), OpKind::Register | OpKind::Memory) {
+                    self.record_control_transfer(
+                        instruction.ip32(),
+                        target,
+                        self.state.registers.esp,
+                        ControlTransferKind::Jump,
+                    );
+                }
+                self.state.registers.eip = target;
+            }
+            Mnemonic::Loop => {
+                self.state.registers.ecx = self.state.registers.ecx.wrapping_sub(1);
+                self.state.registers.eip = if self.state.registers.ecx != 0 {
+                    self.read_branch_target(memory, instruction, 0)?
+                } else {
+                    next_ip
+                };
             }
             mnemonic if is_conditional_jump(mnemonic) => {
                 self.state.registers.eip = if self.condition(mnemonic) {
@@ -854,6 +920,24 @@ impl Interpreter {
         self.state.x87_top = self.state.x87_top.wrapping_sub(1) & 7;
         self.state.x87_registers[usize::from(self.state.x87_top)] = value.to_bits();
         self.update_x87_top_status();
+    }
+
+    fn record_control_transfer(
+        &mut self,
+        source: u32,
+        target: u32,
+        stack_pointer: u32,
+        kind: ControlTransferKind,
+    ) {
+        if self.recent_control_transfers.len() == CONTROL_TRANSFER_HISTORY_LIMIT {
+            self.recent_control_transfers.pop_front();
+        }
+        self.recent_control_transfers.push_back(ControlTransfer {
+            source,
+            target,
+            stack_pointer,
+            kind,
+        });
     }
 
     fn x87_pop(&mut self) {
@@ -1876,7 +1960,12 @@ fn record_code_pages(
 fn is_block_terminal(instruction: &Instruction) -> bool {
     matches!(
         instruction.mnemonic(),
-        Mnemonic::Call | Mnemonic::Ret | Mnemonic::Jmp | Mnemonic::Hlt | Mnemonic::Int3
+        Mnemonic::Call
+            | Mnemonic::Ret
+            | Mnemonic::Jmp
+            | Mnemonic::Loop
+            | Mnemonic::Hlt
+            | Mnemonic::Int3
     ) || is_conditional_jump(instruction.mnemonic())
         || is_string_mnemonic(instruction.mnemonic())
 }
@@ -2695,6 +2784,51 @@ mod tests {
             }
         );
         assert_eq!(cpu.state.registers.eip, 0x1001);
+    }
+
+    #[test]
+    fn records_indirect_call_and_return_targets() {
+        // mov eax,1008h; call eax; hlt; ret
+        let (mut cpu, mut memory) = machine(&[0xb8, 0x08, 0x10, 0, 0, 0xff, 0xd0, 0xf4, 0xc3]);
+        for _ in 0..4 {
+            cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        }
+        assert_eq!(
+            cpu.recent_control_transfers(),
+            vec![
+                ControlTransfer {
+                    source: 0x1005,
+                    target: 0x1008,
+                    stack_pointer: 0x3000,
+                    kind: ControlTransferKind::Call,
+                },
+                ControlTransfer {
+                    source: 0x1008,
+                    target: 0x1007,
+                    stack_pointer: 0x2ffc,
+                    kind: ControlTransferKind::Return,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_decrements_ecx_without_changing_flags() {
+        // mov ecx,3; inc eax; loop -3; hlt
+        let (mut cpu, mut memory) = machine(&[0xb9, 3, 0, 0, 0, 0x40, 0xe2, 0xfd, 0xf4]);
+        cpu.state.registers.eflags = 0x2 | FLAG_CF | FLAG_ZF;
+
+        for _ in 0..8 {
+            cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        }
+
+        assert_eq!(cpu.state.registers.eax, 3);
+        assert_eq!(cpu.state.registers.ecx, 0);
+        assert!(cpu.state.halted);
+        // INC changes arithmetic flags, but LOOP itself must leave the final
+        // flags produced by the last INC untouched.
+        assert!(!cpu.state.registers.flag(FLAG_ZF));
+        assert!(cpu.state.registers.flag(FLAG_CF));
     }
 
     fn machine(code: &[u8]) -> (Interpreter, GuestMemory) {

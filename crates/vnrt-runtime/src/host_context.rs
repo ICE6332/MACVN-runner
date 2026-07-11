@@ -26,6 +26,7 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) command_line_utf16: GuestAddress,
     pub(super) module_path: &'a str,
     pub(super) last_error: &'a mut u32,
+    pub(super) error_mode: &'a mut u32,
     pub(super) process_io: &'a mut ProcessIo,
     pub(super) guest_stdout: &'a mut Vec<u8>,
     pub(super) guest_stderr: &'a mut Vec<u8>,
@@ -374,6 +375,12 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.host_modules.get(&normalized).copied()
     }
 
+    fn loaded_module_name(&self, module: GuestAddress) -> Option<String> {
+        self.host_modules
+            .iter()
+            .find_map(|(name, handle)| (*handle == module).then(|| name.clone()))
+    }
+
     fn resolve_host_api(
         &mut self,
         module: GuestAddress,
@@ -427,6 +434,10 @@ impl HostCallContext for RuntimeHostContext<'_> {
         *self.last_error = value;
     }
 
+    fn replace_process_error_mode(&mut self, mode: u32) -> u32 {
+        std::mem::replace(self.error_mode, mode)
+    }
+
     fn open_file_read(&mut self, path: &str) -> Result<Handle, Win32Error> {
         self.process_io.open_read(path)
     }
@@ -437,6 +448,14 @@ impl HostCallContext for RuntimeHostContext<'_> {
 
     fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error> {
         self.process_io.close(handle)
+    }
+
+    fn create_directory(&mut self, path: &str) -> Result<(), Win32Error> {
+        self.process_io.create_directory(path)
+    }
+
+    fn file_attributes(&self, path: &str) -> Result<u32, Win32Error> {
+        self.process_io.file_attributes(path)
     }
 
     fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error> {

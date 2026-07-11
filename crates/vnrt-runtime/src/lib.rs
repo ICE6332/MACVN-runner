@@ -33,8 +33,8 @@ use vnrt_win32::{
     Win32Error,
 };
 use vnrt_x86::{
-    BatchOutcome, CpuError, CpuException, ExternalTargetResolver, Interpreter, Registers,
-    StepOutcome,
+    BatchOutcome, ControlTransfer, CpuError, CpuException, ExternalTargetResolver, Interpreter,
+    Registers, StepOutcome,
 };
 
 /// External targets occupy a reserved, unmapped region near the top of the
@@ -168,6 +168,8 @@ pub struct DiagnosticSnapshot {
     pub exception_chain: Vec<(u32, u32)>,
     /// Most recent host calls, oldest first.
     pub recent_host_calls: Vec<ApiKey>,
+    /// Recent indirect calls, jumps, and returns, oldest first.
+    pub recent_control_transfers: Vec<ControlTransfer>,
 }
 
 /// Errors spanning loader, interpreter, memory, and host-call boundaries.
@@ -237,6 +239,7 @@ pub struct Runtime {
     command_line_utf16: GuestAddress,
     module_path: String,
     last_error: u32,
+    error_mode: u32,
     process_io: ProcessIo,
     guest_stdout: Vec<u8>,
     guest_stderr: Vec<u8>,
@@ -368,6 +371,7 @@ impl Runtime {
             command_line_utf16: process_data.command_line_utf16,
             module_path: config.module_path,
             last_error: 0,
+            error_mode: 0,
             process_io,
             guest_stdout: Vec::new(),
             guest_stderr: Vec::new(),
@@ -437,6 +441,7 @@ impl Runtime {
             stack_words,
             exception_chain,
             recent_host_calls: self.recent_host_calls.iter().cloned().collect(),
+            recent_control_transfers: self.cpu.recent_control_transfers(),
         }
     }
 
@@ -677,6 +682,7 @@ impl Runtime {
             command_line_utf16: self.command_line_utf16,
             module_path: &self.module_path,
             last_error: &mut self.last_error,
+            error_mode: &mut self.error_mode,
             process_io: &mut self.process_io,
             guest_stdout: &mut self.guest_stdout,
             guest_stderr: &mut self.guest_stderr,
