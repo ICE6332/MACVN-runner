@@ -100,10 +100,10 @@ amount of compatibility surface, rather than broad Windows coverage.
 ## Next highest-leverage milestone: Chinese launcher section mapping
 
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes
-and resolves its initial NTDLL surface. Continue through `NtCreateSection` /
-`NtMapViewOfSection`, implement only the section semantics it actually invokes,
-and identify the unpacked child image before returning to the first-window
-milestone.
+and its NTDLL export census has reached object and virtual-memory APIs. Finish
+that census, continue through `NtCreateSection` / `NtMapViewOfSection`, implement
+only the section semantics it actually invokes, and identify the unpacked child
+image before returning to the first-window milestone.
 
 ## Following target milestone: complete target and first real window
 

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+vnrt-memory = { path = "../vnrt-memory" }
 vnrt-win32 = { path = "../vnrt-win32" }
 
 [lints]

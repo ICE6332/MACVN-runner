@@ -528,6 +528,7 @@ dependencies = [
 name = "vnrt-ntdll"
 version = "0.1.0"
 dependencies = [
+ "vnrt-memory",
  "vnrt-win32",
 ]
 

@@ -23,6 +23,18 @@ Completed loader surface:
 - `LoadLibraryA/W` for modeled Host DLLs.
 - Automatically generated synthetic module images for every registered API module.
 - A loadable synthetic `ntdll.dll`.
-- Observed NTDLL exports: `NtContinue`, `NtQuerySection`, `RtlNtStatusToDosError`, `RtlDosPathNameToNtPathName_U`, `RtlFreeUnicodeString`, `NtCreateSection`, and `NtMapViewOfSection`.
+- The observed NTDLL export census now also covers the loader's registry,
+  process, thread, file, object, and virtual-memory probes. The latest resolved
+  frontier is `NtDuplicateObject`; unresolved names remain explicit resolution
+  stubs so a real call fails at the exact API boundary.
 
-The NTDLL names are currently resolution stubs. The next step is to continue until the loader invokes one, then implement the section/view semantics from the actual arguments. The HD executable remains useful as a comparison path but is not the primary target.
+The first target-relevant NTDLL semantics are implemented:
+
+- `NtAllocateVirtualMemory` for the current process.
+- `NtReadVirtualMemory` and `NtWriteVirtualMemory` for current-process Guest memory.
+- `RtlInitUnicodeString` using the 32-bit `UNICODE_STRING` layout.
+- `RtlAcquirePebLock` and `RtlReleasePebLock` as documented single-thread no-ops.
+
+The next step is to finish the export census, then implement the first executed
+section/view or object API from its actual arguments. The HD executable remains
+useful as a comparison path but is not the primary target.
