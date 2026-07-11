@@ -1,17 +1,12 @@
 [package]
-name = "vnrt-win32"
+name = "vnrt-gfx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-encoding_rs.workspace = true
-serde.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
-vnrt-memory = { path = "../vnrt-memory" }
-vnrt-gfx = { path = "../vnrt-gfx" }
 
 [lints]
 workspace = true

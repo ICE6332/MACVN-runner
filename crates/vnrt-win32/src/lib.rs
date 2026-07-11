@@ -13,6 +13,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
+pub use vnrt_gfx::{TextureDescriptor, TextureId};
 pub use vnrt_memory::GuestAddress;
 
 /// Default safety limit for NUL-terminated guest strings.
@@ -921,6 +922,21 @@ pub trait HostCallContext {
         bits_per_pixel: u16,
         pixels: GuestAddress,
     ) -> Result<bool, Win32Error>;
+    /// Human-readable name of the attached Host GPU adapter.
+    fn graphics_adapter_name(&self) -> Option<&str>;
+    /// Allocate a backend-neutral GPU texture.
+    fn create_graphics_texture(
+        &mut self,
+        descriptor: TextureDescriptor,
+    ) -> Result<TextureId, Win32Error>;
+    /// Upload a complete tightly packed GPU texture.
+    fn write_graphics_texture(
+        &mut self,
+        texture: TextureId,
+        bytes: &[u8],
+    ) -> Result<(), Win32Error>;
+    /// Destroy a backend-neutral GPU texture.
+    fn destroy_graphics_texture(&mut self, texture: TextureId) -> bool;
     /// Attach an owned region handle to a Guest window.
     fn set_window_region(&mut self, window: u32, region: u32);
     /// Read guest bytes for string and structure arguments.
@@ -1396,6 +1412,9 @@ pub enum Win32Error {
         /// Host error text.
         message: String,
     },
+    /// The selected Host GPU backend rejected an operation.
+    #[error("Win32 graphics backend failed: {0}")]
+    Graphics(String),
 }
 
 #[cfg(test)]

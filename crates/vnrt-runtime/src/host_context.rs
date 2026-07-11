@@ -48,6 +48,7 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) next_gdi_object: &'a mut u32,
     pub(super) gdi_dc_attributes: &'a mut HashMap<(u32, u32), u32>,
     pub(super) window_frames: &'a mut HashMap<u32, WindowFrame>,
+    pub(super) graphics: &'a mut Option<Box<dyn GraphicsDevice>>,
     pub(super) next_window_handle: &'a mut u32,
     pub(super) image_base: GuestAddress,
     pub(super) resource_directory: Option<(GuestAddress, u32)>,
@@ -695,6 +696,43 @@ impl HostCallContext for RuntimeHostContext<'_> {
             bits_per_pixel,
             pixels,
         )
+    }
+
+    fn graphics_adapter_name(&self) -> Option<&str> {
+        self.graphics.as_deref().map(GraphicsDevice::adapter_name)
+    }
+
+    fn create_graphics_texture(
+        &mut self,
+        descriptor: TextureDescriptor,
+    ) -> Result<TextureId, Win32Error> {
+        self.graphics
+            .as_deref_mut()
+            .ok_or(Win32Error::Unsupported {
+                feature: "Host GPU device",
+            })?
+            .create_texture(descriptor)
+            .map_err(|error| Win32Error::Graphics(error.to_string()))
+    }
+
+    fn write_graphics_texture(
+        &mut self,
+        texture: TextureId,
+        bytes: &[u8],
+    ) -> Result<(), Win32Error> {
+        self.graphics
+            .as_deref_mut()
+            .ok_or(Win32Error::Unsupported {
+                feature: "Host GPU device",
+            })?
+            .write_texture(texture, bytes)
+            .map_err(|error| Win32Error::Graphics(error.to_string()))
+    }
+
+    fn destroy_graphics_texture(&mut self, texture: TextureId) -> bool {
+        self.graphics
+            .as_deref_mut()
+            .is_some_and(|graphics| graphics.destroy_texture(texture))
     }
 
     fn set_window_region(&mut self, window: u32, region: u32) {

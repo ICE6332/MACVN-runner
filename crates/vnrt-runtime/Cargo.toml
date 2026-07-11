@@ -15,6 +15,7 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 vnrt-memory = { path = "../vnrt-memory" }
+vnrt-gfx = { path = "../vnrt-gfx" }
 vnrt-pe = { path = "../vnrt-pe" }
 vnrt-win32 = { path = "../vnrt-win32" }
 vnrt-x86 = { path = "../vnrt-x86" }

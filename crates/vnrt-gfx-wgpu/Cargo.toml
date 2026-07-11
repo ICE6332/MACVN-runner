@@ -1,17 +1,15 @@
 [package]
-name = "vnrt-win32"
+name = "vnrt-gfx-wgpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-encoding_rs.workspace = true
-serde.workspace = true
+pollster = "1.0.1"
 thiserror.workspace = true
-tracing.workspace = true
-vnrt-memory = { path = "../vnrt-memory" }
 vnrt-gfx = { path = "../vnrt-gfx" }
+wgpu.workspace = true
 
 [lints]
 workspace = true

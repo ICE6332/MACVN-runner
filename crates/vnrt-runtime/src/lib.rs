@@ -26,6 +26,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, trace};
+use vnrt_gfx::{GraphicsDevice, TextureDescriptor, TextureId};
 use vnrt_memory::{GuestAddress, GuestMemory, MemoryError, PAGE_SIZE_U32, Permissions};
 use vnrt_pe::{Import, PeError, PeImage, Section};
 use vnrt_win32::{
@@ -275,6 +276,7 @@ pub struct Runtime {
     next_gdi_object: u32,
     gdi_dc_attributes: HashMap<(u32, u32), u32>,
     window_frames: HashMap<u32, WindowFrame>,
+    graphics: Option<Box<dyn GraphicsDevice>>,
     next_window_handle: u32,
     virtual_memory: GuestRegionAllocator,
     recent_host_calls: VecDeque<ApiKey>,
@@ -442,6 +444,7 @@ impl Runtime {
             next_gdi_object: 0x000d_0000,
             gdi_dc_attributes: HashMap::new(),
             window_frames: HashMap::new(),
+            graphics: None,
             next_window_handle: 0x0008_0000,
             virtual_memory: GuestRegionAllocator::new(GUEST_VIRTUAL_BASE, GUEST_VIRTUAL_LIMIT),
             recent_host_calls: VecDeque::with_capacity(HOST_CALL_HISTORY_LIMIT),
@@ -554,6 +557,11 @@ impl Runtime {
         let mut windows = self.window_frames.keys().copied().collect::<Vec<_>>();
         windows.sort_unstable();
         windows
+    }
+
+    /// Attach the real Host GPU used by Direct3D compatibility frontends.
+    pub fn set_graphics_device(&mut self, graphics: Box<dyn GraphicsDevice>) {
+        self.graphics = Some(graphics);
     }
 
     /// Run until termination or an explicit execution limit.
@@ -803,6 +811,7 @@ impl Runtime {
             next_gdi_object: &mut self.next_gdi_object,
             gdi_dc_attributes: &mut self.gdi_dc_attributes,
             window_frames: &mut self.window_frames,
+            graphics: &mut self.graphics,
             next_window_handle: &mut self.next_window_handle,
             image_base: self.image_base,
             resource_directory: self.resource_directory,

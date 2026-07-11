@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use vnrt_gfx::GraphicsDevice;
 use vnrt_runtime::{DiagnosticSnapshot, RunLimits, RunOutcome, Runtime, RuntimeConfig};
 use vnrt_win32::{ApiRegistry, GuestAddress};
 
@@ -36,9 +37,12 @@ fn main() -> Result<ExitCode> {
     let mut registry = ApiRegistry::new();
     vnrt_advapi32::register(&mut registry);
     vnrt_comctl32::register(&mut registry);
+    vnrt_d3d9::register(&mut registry);
+    vnrt_dsound::register(&mut registry);
     vnrt_gdi32::register(&mut registry);
     vnrt_imm32::register(&mut registry);
     vnrt_kernel32::register(&mut registry);
+    vnrt_logprint::register(&mut registry);
     vnrt_ntdll::register(&mut registry);
     vnrt_ole32::register(&mut registry);
     vnrt_psapi::register(&mut registry);
@@ -62,6 +66,9 @@ fn main() -> Result<ExitCode> {
     };
     let mut runtime = Runtime::load_with_config(&bytes, registry, config)
         .with_context(|| format!("failed to load {}", arguments.path.display()))?;
+    let graphics = vnrt_gfx_wgpu::WgpuGraphicsDevice::new().context("failed to initialize GPU")?;
+    info!(adapter = graphics.adapter_name(), "Host GPU initialized");
+    runtime.set_graphics_device(Box::new(graphics));
 
     info!(path = %arguments.path.display(), "guest image loaded");
     let outcome = match runtime.run(RunLimits {
@@ -70,11 +77,13 @@ fn main() -> Result<ExitCode> {
         Ok(outcome) => outcome,
         Err(runtime_error) => {
             let snapshot = runtime.diagnostic_snapshot();
+            let fault_code_window = memory_window(&runtime, snapshot.registers.eip, 48, 80);
             error!(
                 error = %runtime_error,
                 registers = %vnrt_debugger::format_registers(&snapshot.registers),
                 fs_base = format_args!("{:#010x}", snapshot.fs_base),
                 instruction_bytes = %format_bytes(&snapshot.instruction_bytes),
+                fault_code_window,
                 stack_words = ?snapshot.stack_words,
                 stack_pointer_previews = ?stack_pointer_previews(&runtime, &snapshot.stack_words),
                 exception_chain = ?snapshot.exception_chain,
@@ -94,6 +103,18 @@ fn main() -> Result<ExitCode> {
         RunOutcome::Exited(code) => ExitCode::from(code.to_le_bytes()[0]),
         RunOutcome::Halted => ExitCode::SUCCESS,
     })
+}
+
+fn memory_window(runtime: &Runtime, center: u32, before: u32, length: usize) -> String {
+    let start = center.saturating_sub(before);
+    let mut bytes = vec![0_u8; length];
+    runtime
+        .memory
+        .read(GuestAddress(start), &mut bytes)
+        .map_or_else(
+            |_| format!("{start:#010x}: <unmapped>"),
+            |_| format!("{start:#010x}: {}", format_bytes(&bytes)),
+        )
 }
 
 fn stack_pointer_previews(runtime: &Runtime, words: &[u32]) -> Vec<(u32, String)> {

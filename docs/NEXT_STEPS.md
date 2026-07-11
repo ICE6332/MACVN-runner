@@ -112,9 +112,13 @@ the NTDLL export census is resolved, and an unpacked child image is mapped near
 Shell32, Advapi32, COMCTL32, Ole32, WinMM, IMM32, and Version import passes.
 Window-class registration, Guest window objects, WndProc callbacks, painting,
 the initial message queue, DIB transfer, and RGBA frame capture are modeled.
-The current boundary is `d3d9.dll`; build the minimum Direct3D 9 COM object,
-surface/texture locking, and `Present` path required by the target, then connect
-captured frames to the SDL3 native backend.
+The D3D9 and DirectSound modules now resolve, as does the absent optional
+`logprint.dll` probe family. The child enters its real bootstrap but currently
+returns into an already invalidated generated call block near `0x100a817b`.
+Trace the expected non-returning child-entry transition first. Once real D3D
+calls appear, build only the observed COM objects over `vnrt-gfx`; the wgpu
+backend already creates and uploads real Host GPU textures. Then connect the
+resulting swapchain image to an SDL3 native window.
 
 ## Following target milestone: complete target and first real window
 

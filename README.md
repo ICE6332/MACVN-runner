@@ -7,7 +7,8 @@ This is not Wine and is not intended to run arbitrary Windows software.
 ## Current status
 
 - PE32 loading, imports, TLS, TEB/PEB, memory, files, and callbacks work.
-- The headless runner covers a growing Kernel32/User32/GDI32/WinMM surface and can capture Guest DIB presentation as RGBA frames.
+- The runner covers a growing Kernel32/User32/GDI32/WinMM surface and can capture Guest DIB presentation as RGBA frames.
+- A backend-neutral graphics layer now owns real wgpu textures; wgpu selects Metal on macOS while leaving Vulkan, D3D12, and GLES available on other hosts.
 - The primary target is the Chinese `euphoriaCN.exe` launcher; its unpacked child has crossed the observed system-DLL import pass and now reaches `d3d9.dll`.
 - The HD executable remains a comparison target and reaches its license dialog before the missing `system/YSCom/YSCom.exe` dependency.
 
@@ -34,6 +35,8 @@ cargo check --workspace --all-features
 - `apps/vnrt-runner`: command-line runner
 - `apps/vnrt-inspect`: PE32 metadata inspector
 - `crates/vnrt-runtime`: loader/runtime composition
+- `crates/vnrt-gfx`: backend-neutral GPU resources
+- `crates/vnrt-gfx-wgpu`: Metal/Vulkan/D3D12/GLES backend through wgpu
 - `crates/vnrt-x86`: x86 interpreter
 - `crates/vnrt-*32`: target-driven Win32 API surfaces
 - `docs/NEXT_STEPS.md`: roadmap

@@ -17,9 +17,14 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vnrt-debugger = { path = "../../crates/vnrt-debugger" }
+vnrt-d3d9 = { path = "../../crates/vnrt-d3d9" }
+vnrt-dsound = { path = "../../crates/vnrt-dsound" }
 vnrt-gdi32 = { path = "../../crates/vnrt-gdi32" }
+vnrt-gfx = { path = "../../crates/vnrt-gfx" }
+vnrt-gfx-wgpu = { path = "../../crates/vnrt-gfx-wgpu" }
 vnrt-imm32 = { path = "../../crates/vnrt-imm32" }
 vnrt-kernel32 = { path = "../../crates/vnrt-kernel32" }
+vnrt-logprint = { path = "../../crates/vnrt-logprint" }
 vnrt-ntdll = { path = "../../crates/vnrt-ntdll" }
 vnrt-ole32 = { path = "../../crates/vnrt-ole32" }
 vnrt-psapi = { path = "../../crates/vnrt-psapi" }

@@ -95,7 +95,19 @@ for a native backend to upload when the target uses this path.
 The child has also crossed Shell32, Advapi32, COMCTL32, Ole32, WinMM, IMM32, and
 Version imports. WinMM has real sandboxed MMIO file reads/seeks and RIFF chunk
 descent/ascent; unavailable audio devices and input methods remain explicit.
-The current observed boundary is loading `d3d9.dll`, which identifies Direct3D
-9 as the next graphics mainline. No native SDL3 window has been created yet.
+The import census now also crosses D3D9 and DirectSound discovery, followed by
+the target's absent optional `logprint.dll` plugin (`Test`, `Test2`, and the same
+numbered cdecl probe family). The child then leaves the import-error path and
+enters its real bootstrap. Its current failure is a return into a transient
+generated-code block near `0x100a817b`; that block has already invalidated its
+own call site, so the next task is to identify the expected non-returning child
+entry transition rather than misclassifying the resulting bytes as an x86
+instruction.
+
+The Host graphics substrate now uses wgpu 30 and has been verified locally to
+select a real GPU, create an RGBA render-target texture, upload pixels, and
+destroy it. D3D Guest interfaces will remain thin ABI/state adapters over this
+shared backend, allowing later D3D8/D3D11 frontends to reuse Metal/Vulkan/D3D12
+resource ownership. No native SDL3 window has been created yet.
 The HD executable remains useful as a comparison path but is not the primary
 target.

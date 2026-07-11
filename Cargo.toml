@@ -7,14 +7,19 @@ members = [
     "crates/vnrt-x86",
     "crates/vnrt-win32",
     "crates/vnrt-kernel32",
+    "crates/vnrt-logprint",
     "crates/vnrt-advapi32",
     "crates/vnrt-comctl32",
+    "crates/vnrt-d3d9",
+    "crates/vnrt-dsound",
     "crates/vnrt-psapi",
     "crates/vnrt-user32",
     "crates/vnrt-version",
     "crates/vnrt-shell32",
     "crates/vnrt-ole32",
     "crates/vnrt-gdi32",
+    "crates/vnrt-gfx",
+    "crates/vnrt-gfx-wgpu",
     "crates/vnrt-imm32",
     "crates/vnrt-winmm",
     "crates/vnrt-runtime",
@@ -41,6 +46,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wgpu = { version = "30.0.0", default-features = false, features = ["std", "dx12", "gles", "metal", "vulkan", "wgsl"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
