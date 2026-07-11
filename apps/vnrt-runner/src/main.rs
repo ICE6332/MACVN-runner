@@ -36,6 +36,7 @@ fn main() -> Result<ExitCode> {
     let mut registry = ApiRegistry::new();
     vnrt_gdi32::register(&mut registry);
     vnrt_kernel32::register(&mut registry);
+    vnrt_ntdll::register(&mut registry);
     vnrt_ole32::register(&mut registry);
     vnrt_shell32::register(&mut registry);
     vnrt_user32::register(&mut registry);
@@ -70,6 +71,7 @@ fn main() -> Result<ExitCode> {
                 fs_base = format_args!("{:#010x}", snapshot.fs_base),
                 instruction_bytes = %format_bytes(&snapshot.instruction_bytes),
                 stack_words = ?snapshot.stack_words,
+                exception_chain = ?snapshot.exception_chain,
                 recent_host_calls = ?snapshot.recent_host_calls,
                 "guest execution failed"
             );

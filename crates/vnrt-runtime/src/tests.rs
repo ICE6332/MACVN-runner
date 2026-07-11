@@ -259,6 +259,52 @@ fn resumes_a_suspended_host_call_after_guest_stdcall_callback() {
 }
 
 #[test]
+fn dispatches_int3_through_the_guest_seh_chain() {
+    let image = image_with_one_import();
+    let mut runtime = Runtime::load(&image, ApiRegistry::new()).expect("image should load");
+    runtime
+        .memory
+        .map_range(GuestAddress(0x3000), PAGE_SIZE_U32, Permissions::ALL)
+        .unwrap();
+    runtime
+        .memory
+        .write(GuestAddress(0x3000), &[0xcc, 0xf4])
+        .unwrap();
+    runtime
+        .memory
+        .write(GuestAddress(0x3010), &[0x31, 0xc0, 0xc3])
+        .unwrap();
+    let registration = GuestAddress(GUEST_STACK_TOP - 0x20);
+    runtime.memory.write_u32(registration, u32::MAX).unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(registration.0 + 4), 0x3010)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(GUEST_TEB_BASE), registration.0)
+        .unwrap();
+    runtime.cpu.state.registers.eip = 0x3000;
+    runtime.cpu.state.registers.esp = GUEST_STACK_TOP - 0x100;
+
+    let outcome = runtime
+        .run(RunLimits {
+            max_instructions: 16,
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "SEH handler should continue after INT3: {error}; {:?}",
+                runtime.diagnostic_snapshot()
+            )
+        });
+
+    assert_eq!(outcome, RunOutcome::Halted);
+    assert_eq!(runtime.cpu.state.registers.eip, 0x3002);
+    assert_eq!(runtime.cpu.state.registers.esp, GUEST_STACK_TOP - 0x100);
+    assert!(runtime.pending_exception.is_none());
+}
+
+#[test]
 fn runs_compiler_generated_pe32_fixture() {
     let image = include_bytes!("../../../tests/guest-programs/exit42.exe");
     let parsed_image = vnrt_pe::parse(image).expect("fixture metadata should parse");

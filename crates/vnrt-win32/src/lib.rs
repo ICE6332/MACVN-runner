@@ -599,6 +599,8 @@ pub trait HostCallContext {
     fn set_tls_value(&mut self, index: u32, value: u32) -> Result<(), Win32Error>;
     /// Replace the process top-level exception filter and return its old pointer.
     fn replace_unhandled_exception_filter(&mut self, filter: u32) -> u32;
+    /// Return the process top-level exception filter, or null when none is installed.
+    fn unhandled_exception_filter(&self) -> GuestAddress;
     /// Enter the initial thread's simplified COM apartment and return HRESULT.
     fn initialize_com(&mut self) -> u32;
     /// Balance one successful COM apartment initialization.

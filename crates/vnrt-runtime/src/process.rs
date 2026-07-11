@@ -146,6 +146,49 @@ pub(super) fn initialize_host_module_image(
     Ok(())
 }
 
+pub(super) fn initialize_host_modules(
+    memory: &mut GuestMemory,
+    registry: &ApiRegistry,
+    import_thunks: &mut HashMap<GuestAddress, ApiKey>,
+) -> Result<HashMap<String, GuestAddress>, RuntimeError> {
+    let mut modules = registry
+        .registered_keys()
+        .into_iter()
+        .map(|key| key.module)
+        .collect::<Vec<_>>();
+    modules.extend([
+        "kernel32.dll".to_owned(),
+        "user32.dll".to_owned(),
+        "ntdll.dll".to_owned(),
+    ]);
+    modules.sort();
+    modules.dedup();
+
+    let mut host_modules = HashMap::new();
+    host_modules.insert(
+        "kernel32.dll".to_owned(),
+        GuestAddress(KERNEL32_MODULE_HANDLE),
+    );
+    host_modules.insert("user32.dll".to_owned(), GuestAddress(USER32_MODULE_HANDLE));
+    host_modules.insert("ntdll.dll".to_owned(), GuestAddress(NTDLL_MODULE_HANDLE));
+    let mut next_handle = NTDLL_MODULE_HANDLE + HOST_MODULE_IMAGE_SIZE;
+    for module in modules {
+        let handle = if let Some(handle) = host_modules.get(&module).copied() {
+            handle
+        } else {
+            if next_handle >= GUEST_STACK_BASE {
+                return Err(RuntimeError::Unsupported("too many synthetic Host DLLs"));
+            }
+            let handle = GuestAddress(next_handle);
+            host_modules.insert(module.clone(), handle);
+            next_handle += HOST_MODULE_IMAGE_SIZE;
+            handle
+        };
+        initialize_host_module_image(memory, registry, import_thunks, &module, handle)?;
+    }
+    Ok(host_modules)
+}
+
 pub(super) struct StaticTlsLayout {
     pub(super) slots: GuestAddress,
     pub(super) callbacks: Vec<GuestAddress>,

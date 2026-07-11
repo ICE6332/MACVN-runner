@@ -121,6 +121,10 @@ pub fn register(registry: &mut ApiRegistry) {
         ApiKey::new(MODULE, "SetUnhandledExceptionFilter"),
         SetUnhandledExceptionFilter,
     );
+    registry.register(
+        ApiKey::new(MODULE, "UnhandledExceptionFilter"),
+        UnhandledExceptionFilter,
+    );
     registry.register(ApiKey::new(MODULE, "CreateMutexA"), CreateMutexA);
     registry.register(ApiKey::new(MODULE, "ReleaseMutex"), ReleaseMutex);
     registry.register(ApiKey::new(MODULE, "CreateEventA"), CreateEventA);
@@ -144,6 +148,14 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(
         ApiKey::new(MODULE, "GetModuleHandleW"),
         GetModuleHandle { wide: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "LoadLibraryA"),
+        LoadLibrary { wide: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "LoadLibraryW"),
+        LoadLibrary { wide: true },
     );
     registry.register(ApiKey::new(MODULE, "GetProcAddress"), GetProcAddress);
     registry.register(
@@ -906,6 +918,24 @@ impl HostCallHandler for SetUnhandledExceptionFilter {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct UnhandledExceptionFilter;
+
+impl HostCallHandler for UnhandledExceptionFilter {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let exception_pointers = context.argument_u32(0)?;
+        let filter = context.unhandled_exception_filter();
+        context.set_stdcall_cleanup(4);
+        if filter.0 == 0 {
+            context.set_return_u32(0); // EXCEPTION_CONTINUE_SEARCH
+            return Ok(());
+        }
+        context.request_guest_callback(filter, &[exception_pointers])?;
+        context.use_guest_callback_return_value();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct CreateMutexA;
 
 impl HostCallHandler for CreateMutexA {
@@ -1259,6 +1289,39 @@ impl HostCallHandler for GetModuleHandle {
 
 #[derive(Debug, Clone, Copy)]
 struct GetProcAddress;
+
+#[derive(Debug, Clone, Copy)]
+struct LoadLibrary {
+    wide: bool,
+}
+
+impl HostCallHandler for LoadLibrary {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let name_address = GuestAddress(context.argument_u32(0)?);
+        if name_address.0 == 0 {
+            context.set_last_error(87); // ERROR_INVALID_PARAMETER
+            context.set_return_u32(0);
+            context.set_stdcall_cleanup(4);
+            return Ok(());
+        }
+        let name = if self.wide {
+            read_utf16_z(context, name_address)?
+        } else {
+            read_ansi_z(context, name_address)?
+        };
+        if let Some(handle) = context.loaded_module_handle(&name) {
+            debug!(name, handle = handle.0, "loaded modeled Guest DLL");
+            context.set_last_error(0);
+            context.set_return_u32(handle.0);
+        } else {
+            debug!(name, "Guest DLL is not modeled");
+            context.set_last_error(126); // ERROR_MOD_NOT_FOUND
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for GetProcAddress {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
@@ -2456,11 +2519,14 @@ mod tests {
     fn registers_initial_surface() {
         let mut registry = ApiRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 88);
-        assert!(
-            registry
-                .resolve(&ApiKey::new(MODULE, "ExitProcess"))
-                .is_some()
-        );
+        for name in [
+            "ExitProcess",
+            "SetUnhandledExceptionFilter",
+            "UnhandledExceptionFilter",
+            "LoadLibraryA",
+            "LoadLibraryW",
+        ] {
+            assert!(registry.resolve(&ApiKey::new(MODULE, name)).is_some());
+        }
     }
 }

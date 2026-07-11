@@ -17,6 +17,7 @@ tracing-subscriber.workspace = true
 vnrt-debugger = { path = "../../crates/vnrt-debugger" }
 vnrt-gdi32 = { path = "../../crates/vnrt-gdi32" }
 vnrt-kernel32 = { path = "../../crates/vnrt-kernel32" }
+vnrt-ntdll = { path = "../../crates/vnrt-ntdll" }
 vnrt-ole32 = { path = "../../crates/vnrt-ole32" }
 vnrt-runtime = { path = "../../crates/vnrt-runtime" }
 vnrt-shell32 = { path = "../../crates/vnrt-shell32" }

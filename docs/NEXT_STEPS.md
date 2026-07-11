@@ -94,7 +94,15 @@ amount of compatibility surface, rather than broad Windows coverage.
 - Execute target-observed `LEAVE`, `NOT`, `XCHG`, EFLAGS probing, x87 control
   state, and the minimal MMX `MOVD/PUNPCKLDQ/MOVQ/EMMS` sequence.
 
-## Next highest-leverage milestone: complete target and first real window
+## Next highest-leverage milestone: Chinese launcher section mapping
+
+The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes
+and resolves its initial NTDLL surface. Continue through `NtCreateSection` /
+`NtMapViewOfSection`, implement only the section semantics it actually invokes,
+and identify the unpacked child image before returning to the first-window
+milestone.
+
+## Following target milestone: complete target and first real window
 
 Generic Host-to-Guest callback continuation, nested synchronous callbacks, and
 the real `DialogBoxParamA`/`EndDialog` path are implemented. The selected local

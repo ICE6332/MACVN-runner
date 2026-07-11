@@ -1,12 +1,14 @@
 //! Composition layer for PE loading, x86 stepping, memory, and host calls.
 
 mod allocation;
+mod exceptions;
 mod host_context;
 mod loader;
 mod objects;
 mod process;
 
 use allocation::*;
+use exceptions::*;
 use host_context::*;
 use loader::*;
 use objects::*;
@@ -30,7 +32,9 @@ use vnrt_win32::{
     ApiKey, ApiRegistry, FileEntry, Handle, HostCallContext, PROCESS_HEAP_HANDLE, ProcessIo,
     Win32Error,
 };
-use vnrt_x86::{CpuError, ExternalTargetResolver, Interpreter, Registers, StepOutcome};
+use vnrt_x86::{
+    CpuError, CpuException, ExternalTargetResolver, Interpreter, Registers, StepOutcome,
+};
 
 /// External targets occupy a reserved, unmapped region near the top of the
 /// 32-bit address space. Reaching one is intercepted before instruction fetch.
@@ -49,6 +53,7 @@ const GUEST_VIRTUAL_LIMIT: u32 = 0x7f00_0000;
 const HOST_CALL_HISTORY_LIMIT: usize = 16;
 const KERNEL32_MODULE_HANDLE: u32 = 0x7f10_0000;
 const USER32_MODULE_HANDLE: u32 = 0x7f20_0000;
+const NTDLL_MODULE_HANDLE: u32 = 0x7f30_0000;
 const HOST_MODULE_IMAGE_SIZE: u32 = 0x0001_0000;
 const GUEST_PROCESS_DATA_BASE: u32 = 0x0fff_0000;
 const GUEST_PROCESS_DATA_SIZE: u32 = 0x0001_0000;
@@ -157,6 +162,8 @@ pub struct DiagnosticSnapshot {
     pub instruction_bytes: Vec<u8>,
     /// Return address followed by up to eight 32-bit stack arguments.
     pub stack_words: Vec<u32>,
+    /// Active 32-bit SEH registration records as `(record, handler)` pairs.
+    pub exception_chain: Vec<(u32, u32)>,
     /// Most recent host calls, oldest first.
     pub recent_host_calls: Vec<ApiKey>,
 }
@@ -188,6 +195,14 @@ pub enum RuntimeError {
     /// Known future runtime functionality.
     #[error("unsupported runtime feature: {0}")]
     Unsupported(&'static str),
+    /// No Guest SEH frame accepted a synchronous processor exception.
+    #[error("unhandled Guest exception {code:#010x} at {address:#010x}")]
+    UnhandledGuestException {
+        /// Win32 exception status code.
+        code: u32,
+        /// Address that raised the exception.
+        address: u32,
+    },
 }
 
 /// Complete state of one guest process.
@@ -231,6 +246,7 @@ pub struct Runtime {
     tls_callbacks_active: bool,
     suspended_host_calls: Vec<SuspendedHostCall>,
     guest_callback_targets: HashMap<u32, GuestAddress>,
+    pending_exception: Option<PendingException>,
 }
 
 #[derive(Debug)]
@@ -266,20 +282,7 @@ impl Runtime {
         map_image(&mut memory, bytes, &image)?;
         let import_thunks = bind_imports(&mut memory, &image)?;
         let mut import_thunks = import_thunks;
-        initialize_host_module_image(
-            &mut memory,
-            &api_registry,
-            &mut import_thunks,
-            "kernel32.dll",
-            GuestAddress(KERNEL32_MODULE_HANDLE),
-        )?;
-        initialize_host_module_image(
-            &mut memory,
-            &api_registry,
-            &mut import_thunks,
-            "user32.dll",
-            GuestAddress(USER32_MODULE_HANDLE),
-        )?;
+        let host_modules = initialize_host_modules(&mut memory, &api_registry, &mut import_thunks)?;
         let tls = initialize_static_tls(&mut memory, &image)?;
         protect_image(&mut memory, &image)?;
         memory.map_range(
@@ -329,13 +332,6 @@ impl Runtime {
         } else {
             false
         };
-        let host_modules = HashMap::from([
-            (
-                "kernel32.dll".to_owned(),
-                GuestAddress(KERNEL32_MODULE_HANDLE),
-            ),
-            ("user32.dll".to_owned(), GuestAddress(USER32_MODULE_HANDLE)),
-        ]);
         let process_io = ProcessIo::sandboxed(config.filesystem_root, &config.current_directory);
         let environment = config
             .environment
@@ -379,6 +375,7 @@ impl Runtime {
             tls_callbacks_active,
             suspended_host_calls: Vec::new(),
             guest_callback_targets: HashMap::new(),
+            pending_exception: None,
         })
     }
 
@@ -410,11 +407,30 @@ impl Runtime {
                     .and_then(|address| self.memory.read_u32(GuestAddress(address)).ok())
             })
             .collect();
+        let mut exception_chain = Vec::new();
+        let mut record = self
+            .memory
+            .read_u32(GuestAddress(self.cpu.state.fs_base))
+            .unwrap_or(u32::MAX);
+        while record != u32::MAX && exception_chain.len() < 16 {
+            let Ok(next) = self.memory.read_u32(GuestAddress(record)) else {
+                break;
+            };
+            let Ok(handler) = self.memory.read_u32(GuestAddress(record.wrapping_add(4))) else {
+                break;
+            };
+            exception_chain.push((record, handler));
+            if next == record {
+                break;
+            }
+            record = next;
+        }
         DiagnosticSnapshot {
             registers: self.cpu.state.registers,
             fs_base: self.cpu.state.fs_base,
             instruction_bytes,
             stack_words,
+            exception_chain,
             recent_host_calls: self.recent_host_calls.iter().cloned().collect(),
         }
     }
@@ -445,12 +461,19 @@ impl Runtime {
                 self.advance_host_callbacks()?;
                 continue;
             }
+            if self.cpu.state.registers.eip == EXCEPTION_HANDLER_RETURN_ADDRESS {
+                self.advance_exception_dispatch()?;
+                continue;
+            }
             let resolver = ThunkResolver(&self.import_thunks);
             match self.cpu.step(&mut self.memory, &resolver)? {
                 StepOutcome::Continue { instruction } => {
                     trace!(?instruction, "executed instruction");
                 }
                 StepOutcome::ExternalCall { address } => self.dispatch_host_call(address)?,
+                StepOutcome::Exception { exception } => {
+                    self.dispatch_cpu_exception(exception)?;
+                }
                 StepOutcome::Halted => return Ok(RunOutcome::Halted),
             }
             if let Some(code) = self.exit_code {

@@ -210,8 +210,25 @@ pub enum StepOutcome {
         /// Address used by the runtime to locate a registered API.
         address: GuestAddress,
     },
+    /// Guest execution raised a synchronous processor exception.
+    Exception {
+        /// Exception reported to the outer runtime.
+        exception: CpuException,
+    },
     /// Execution was already halted.
     Halted,
+}
+
+/// Synchronous processor exceptions that require operating-system dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuException {
+    /// Software breakpoint raised by `INT3`.
+    Breakpoint {
+        /// Address of the one-byte breakpoint instruction.
+        address: GuestAddress,
+        /// Architectural EIP reported in the exception context.
+        resume_address: GuestAddress,
+    },
 }
 
 /// CPU decode or execution errors.
@@ -335,6 +352,16 @@ impl Interpreter {
         }
 
         let instruction = decode(memory, eip)?;
+        if instruction.mnemonic() == Mnemonic::Int3 {
+            let resume_address = GuestAddress(instruction.next_ip32());
+            self.state.registers.eip = resume_address.0;
+            return Ok(StepOutcome::Exception {
+                exception: CpuException::Breakpoint {
+                    address: eip,
+                    resume_address,
+                },
+            });
+        }
         self.execute(memory, &instruction)?;
         Ok(StepOutcome::Continue { instruction })
     }
@@ -2132,12 +2159,19 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_instruction() {
+    fn reports_int3_as_a_breakpoint_exception() {
         let (mut cpu, mut memory) = machine(&[0xcc]);
-        let error = cpu
-            .step(&mut memory, &NoExternalTargets)
-            .expect_err("INT3 is not implemented yet");
-        assert!(matches!(error, CpuError::UnsupportedInstruction { .. }));
+        let outcome = cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(
+            outcome,
+            StepOutcome::Exception {
+                exception: CpuException::Breakpoint {
+                    address: GuestAddress(0x1000),
+                    resume_address: GuestAddress(0x1001),
+                },
+            }
+        );
+        assert_eq!(cpu.state.registers.eip, 0x1001);
     }
 
     fn machine(code: &[u8]) -> (Interpreter, GuestMemory) {

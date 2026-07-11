@@ -525,6 +525,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vnrt-ntdll"
+version = "0.1.0"
+dependencies = [
+ "vnrt-win32",
+]
+
+[[package]]
 name = "vnrt-ole32"
 version = "0.1.0"
 dependencies = [
@@ -551,6 +558,7 @@ dependencies = [
  "vnrt-debugger",
  "vnrt-gdi32",
  "vnrt-kernel32",
+ "vnrt-ntdll",
  "vnrt-ole32",
  "vnrt-runtime",
  "vnrt-shell32",

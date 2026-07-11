@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vnrt-pe",
     "crates/vnrt-memory",
+    "crates/vnrt-ntdll",
     "crates/vnrt-x86",
     "crates/vnrt-win32",
     "crates/vnrt-kernel32",

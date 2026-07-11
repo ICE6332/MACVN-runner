@@ -8,8 +8,8 @@ This is not Wine and is not intended to run arbitrary Windows software.
 
 - PE32 loading, imports, TLS, TEB/PEB, memory, files, and callbacks work.
 - The headless runner covers a growing Kernel32/User32/GDI32/WinMM surface.
-- The current euphoria HD trace reaches its license dialog and exits cleanly.
-- The next milestone is the first native SDL3 window; local target progress is currently blocked by a missing `system/YSCom/YSCom.exe`.
+- The primary target is the Chinese `euphoriaCN.exe` launcher; its self-unpacking path now reaches NTDLL section setup.
+- The HD executable remains a comparison target and reaches its license dialog before the missing `system/YSCom/YSCom.exe` dependency.
 
 Game files are not included. Use only files you are legally allowed to run.
 
@@ -37,6 +37,7 @@ cargo check --workspace --all-features
 - `crates/vnrt-x86`: x86 interpreter
 - `crates/vnrt-*32`: target-driven Win32 API surfaces
 - `docs/NEXT_STEPS.md`: roadmap
-- `docs/TARGET_EUPHORIA.md`: current target notes
+- `docs/TARGET_EUPHORIA.md`: HD comparison-target notes
+- `docs/TARGET_EUPHORIA_CN.md`: primary Chinese target notes
 
 Licensed under MIT or Apache-2.0.

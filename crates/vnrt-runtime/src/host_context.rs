@@ -268,6 +268,10 @@ impl HostCallContext for RuntimeHostContext<'_> {
         std::mem::replace(self.unhandled_exception_filter, filter)
     }
 
+    fn unhandled_exception_filter(&self) -> GuestAddress {
+        GuestAddress(*self.unhandled_exception_filter)
+    }
+
     fn initialize_com(&mut self) -> u32 {
         let result = u32::from(*self.com_initialization_count != 0); // S_OK / S_FALSE
         *self.com_initialization_count = self.com_initialization_count.saturating_add(1);
