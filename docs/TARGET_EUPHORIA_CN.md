@@ -83,9 +83,19 @@ constructs a Guest `CREATESTRUCT` and dispatches `WM_NCCREATE`/`WM_CREATE` to th
 registered WndProc.
 
 The initial thread also has a modeled message queue covering post, peek, get,
-translate, dispatch, and quit messages. Default-window processing, paint
-requests, display enumeration, clipboard handles, icon/menu lifetime, and the
-common geometry APIs are in place. The current observed unresolved import is
-`RedrawWindow`. No native SDL3 window has been created yet, but the Guest-side
-window/message substrate needed to drive one now exists. The HD executable
-remains useful as a comparison path but is not the primary target.
+translate, dispatch, and quit messages. Default-window processing, invalidation,
+`BeginPaint`/`EndPaint`, display enumeration, clipboard handles, icon/menu
+lifetime, input state, and the common geometry APIs are in place.
+
+The observed GDI32 pass now has memory and window DCs, selected objects, DIB
+sections, bitmap transfer, text/font probes, regions, and frame capture. A DIB
+presented to a window is normalized into a top-down RGBA8 `WindowFrame`, ready
+for a native backend to upload when the target uses this path.
+
+The child has also crossed Shell32, Advapi32, COMCTL32, Ole32, WinMM, IMM32, and
+Version imports. WinMM has real sandboxed MMIO file reads/seeks and RIFF chunk
+descent/ascent; unavailable audio devices and input methods remain explicit.
+The current observed boundary is loading `d3d9.dll`, which identifies Direct3D
+9 as the next graphics mainline. No native SDL3 window has been created yet.
+The HD executable remains useful as a comparison path but is not the primary
+target.

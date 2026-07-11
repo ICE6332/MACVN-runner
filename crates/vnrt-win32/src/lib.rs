@@ -780,6 +780,8 @@ pub trait HostCallContext {
     fn guest_callback_target(&self, object: u32) -> Option<GuestAddress>;
     /// Replace the focused Guest window and return the previous handle.
     fn replace_focus_window(&mut self, window: u32) -> u32;
+    /// Return the current focused/foreground Guest window.
+    fn focused_window(&self) -> u32;
     /// Replace one 32-bit window-class attribute and return its previous value.
     fn replace_window_class_long(&mut self, window: u32, index: i32, value: u32) -> u32;
     /// Read one previously modeled 32-bit window-class attribute.
@@ -839,6 +841,10 @@ pub trait HostCallContext {
     fn destroy_menu(&mut self, menu: u32) -> bool;
     /// Whether a handle identifies a process-owned Guest menu.
     fn is_menu(&self, menu: u32) -> bool;
+    /// Insert one submenu reference into a Guest menu.
+    fn insert_submenu(&mut self, menu: u32, position: usize, submenu: u32) -> bool;
+    /// Return a submenu reference by position.
+    fn submenu(&self, menu: u32, position: usize) -> Option<u32>;
     /// Snapshot all live top-level Guest window handles.
     fn window_handles(&self) -> Vec<u32>;
     /// Return the logical screen-space cursor position.
@@ -861,6 +867,60 @@ pub trait HostCallContext {
     fn replace_window_long(&mut self, window: u32, index: i32, value: u32) -> Option<u32>;
     /// Read one 32-bit per-window attribute.
     fn window_long(&self, window: u32, index: i32) -> Option<u32>;
+    /// Mark a live Guest window as needing paint.
+    fn invalidate_window(&mut self, window: u32) -> bool;
+    /// Clear a live Guest window's pending paint state.
+    fn validate_window(&mut self, window: u32) -> bool;
+    /// Whether a live Guest window currently needs paint.
+    fn window_needs_paint(&self, window: u32) -> bool;
+    /// Return the stable display DC associated with a live Guest window.
+    fn window_dc(&mut self, window: u32) -> Option<u32>;
+    /// Whether a handle is one of the live Guest window display DCs.
+    fn is_window_dc(&self, dc: u32) -> bool;
+    /// Snapshot the Win32 256-byte keyboard state table.
+    fn keyboard_state(&self) -> [u8; 256];
+    /// Replace the Win32 256-byte keyboard state table.
+    fn set_keyboard_state(&mut self, state: &[u8; 256]);
+    /// Whether a handle identifies a screen, window, or memory display DC.
+    fn is_gdi_dc(&self, dc: u32) -> bool;
+    /// Allocate a memory DC compatible with an existing display DC.
+    fn create_memory_dc(&mut self, source: u32) -> Option<u32>;
+    /// Destroy a process-owned memory DC.
+    fn delete_memory_dc(&mut self, dc: u32) -> bool;
+    /// Select an opaque GDI object into a DC and return the previous selection.
+    fn select_gdi_object(&mut self, dc: u32, object: u32) -> Option<u32>;
+    /// Return the object currently selected into a DC.
+    fn selected_gdi_object(&self, dc: u32) -> Option<u32>;
+    /// Allocate a process-owned GDI object with Guest-visible descriptor bytes.
+    fn create_gdi_object(&mut self, descriptor: &[u8]) -> u32;
+    /// Read the descriptor of a process-owned GDI object.
+    fn gdi_object(&self, object: u32) -> Option<Vec<u8>>;
+    /// Destroy a process-owned GDI object.
+    fn delete_gdi_object(&mut self, object: u32) -> bool;
+    /// Replace one scalar DC attribute and return its previous/default value.
+    fn replace_gdi_dc_attribute(
+        &mut self,
+        dc: u32,
+        attribute: u32,
+        value: u32,
+        default: u32,
+    ) -> Option<u32>;
+    /// Snapshot a selected DIB from a source DC into a destination window DC.
+    fn present_selected_bitmap(
+        &mut self,
+        destination: u32,
+        source: u32,
+    ) -> Result<bool, Win32Error>;
+    /// Snapshot direct DIB pixels into a destination window DC.
+    fn present_dib(
+        &mut self,
+        destination: u32,
+        width: u32,
+        height: i32,
+        stride: u32,
+        bits_per_pixel: u16,
+        pixels: GuestAddress,
+    ) -> Result<bool, Win32Error>;
     /// Attach an owned region handle to a Guest window.
     fn set_window_region(&mut self, window: u32, region: u32);
     /// Read guest bytes for string and structure arguments.

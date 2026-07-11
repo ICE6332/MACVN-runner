@@ -97,6 +97,17 @@ impl PlatformBackend for HeadlessBackend {
     }
 }
 
+/// Latest normalized RGBA frame presented to one Guest window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Top-down tightly packed RGBA8 pixels.
+    pub rgba: Vec<u8>,
+}
+
 /// Re-export the selected SDL3 crate only when the native backend is requested.
 /// Concrete window/audio ownership will be added behind this same feature.
 #[cfg(feature = "sdl3-backend")]
@@ -247,11 +258,23 @@ pub struct Runtime {
     primary_display_size: (u32, u32),
     menus: BTreeSet<u32>,
     next_menu_handle: u32,
+    menu_children: HashMap<u32, Vec<u32>>,
     cursor_position: (i32, i32),
     window_menus: HashMap<u32, u32>,
     clipboard_open: bool,
     clipboard_data: HashMap<u32, u32>,
     window_longs: HashMap<(u32, i32), u32>,
+    invalidated_windows: BTreeSet<u32>,
+    window_dcs: HashMap<u32, u32>,
+    next_window_dc: u32,
+    keyboard_state: [u8; 256],
+    memory_dcs: BTreeSet<u32>,
+    next_memory_dc: u32,
+    selected_gdi_objects: HashMap<u32, u32>,
+    gdi_objects: HashMap<u32, Vec<u8>>,
+    next_gdi_object: u32,
+    gdi_dc_attributes: HashMap<(u32, u32), u32>,
+    window_frames: HashMap<u32, WindowFrame>,
     next_window_handle: u32,
     virtual_memory: GuestRegionAllocator,
     recent_host_calls: VecDeque<ApiKey>,
@@ -402,11 +425,23 @@ impl Runtime {
             primary_display_size: (1280, 720),
             menus: BTreeSet::new(),
             next_menu_handle: 0x0009_0000,
+            menu_children: HashMap::new(),
             cursor_position: (640, 360),
             window_menus: HashMap::new(),
             clipboard_open: false,
             clipboard_data: HashMap::new(),
             window_longs: HashMap::new(),
+            invalidated_windows: BTreeSet::new(),
+            window_dcs: HashMap::new(),
+            next_window_dc: 0x000a_0000,
+            keyboard_state: [0; 256],
+            memory_dcs: BTreeSet::new(),
+            next_memory_dc: 0x000b_0000,
+            selected_gdi_objects: HashMap::new(),
+            gdi_objects: HashMap::new(),
+            next_gdi_object: 0x000d_0000,
+            gdi_dc_attributes: HashMap::new(),
+            window_frames: HashMap::new(),
             next_window_handle: 0x0008_0000,
             virtual_memory: GuestRegionAllocator::new(GUEST_VIRTUAL_BASE, GUEST_VIRTUAL_LIMIT),
             recent_host_calls: VecDeque::with_capacity(HOST_CALL_HISTORY_LIMIT),
@@ -505,6 +540,20 @@ impl Runtime {
     #[must_use]
     pub fn guest_stderr(&self) -> &[u8] {
         &self.guest_stderr
+    }
+
+    /// Latest normalized frame presented to a Guest window, if any.
+    #[must_use]
+    pub fn window_frame(&self, window: u32) -> Option<&WindowFrame> {
+        self.window_frames.get(&window)
+    }
+
+    /// Snapshot the handles of windows that have presented at least one frame.
+    #[must_use]
+    pub fn presented_window_handles(&self) -> Vec<u32> {
+        let mut windows = self.window_frames.keys().copied().collect::<Vec<_>>();
+        windows.sort_unstable();
+        windows
     }
 
     /// Run until termination or an explicit execution limit.
@@ -737,11 +786,23 @@ impl Runtime {
             primary_display_size: &mut self.primary_display_size,
             menus: &mut self.menus,
             next_menu_handle: &mut self.next_menu_handle,
+            menu_children: &mut self.menu_children,
             cursor_position: &mut self.cursor_position,
             window_menus: &mut self.window_menus,
             clipboard_open: &mut self.clipboard_open,
             clipboard_data: &mut self.clipboard_data,
             window_longs: &mut self.window_longs,
+            invalidated_windows: &mut self.invalidated_windows,
+            window_dcs: &mut self.window_dcs,
+            next_window_dc: &mut self.next_window_dc,
+            keyboard_state: &mut self.keyboard_state,
+            memory_dcs: &mut self.memory_dcs,
+            next_memory_dc: &mut self.next_memory_dc,
+            selected_gdi_objects: &mut self.selected_gdi_objects,
+            gdi_objects: &mut self.gdi_objects,
+            next_gdi_object: &mut self.next_gdi_object,
+            gdi_dc_attributes: &mut self.gdi_dc_attributes,
+            window_frames: &mut self.window_frames,
             next_window_handle: &mut self.next_window_handle,
             image_base: self.image_base,
             resource_directory: self.resource_directory,

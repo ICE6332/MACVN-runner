@@ -143,8 +143,16 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "SetCursor"), SetCursor);
     registry.register(ApiKey::new(MODULE, "SetCursorPos"), SetCursorPos);
     registry.register(ApiKey::new(MODULE, "GetCursorPos"), GetCursorPos);
+    registry.register(ApiKey::new(MODULE, "GetKeyboardState"), GetKeyboardState);
+    registry.register(ApiKey::new(MODULE, "SetKeyboardState"), SetKeyboardState);
+    registry.register(ApiKey::new(MODULE, "GetKeyState"), GetKeyState);
+    registry.register(ApiKey::new(MODULE, "GetAsyncKeyState"), GetKeyState);
     registry.register(ApiKey::new(MODULE, "UpdateWindow"), UpdateWindow);
     registry.register(ApiKey::new(MODULE, "InvalidateRect"), InvalidateRect);
+    registry.register(ApiKey::new(MODULE, "ValidateRect"), ValidateRect);
+    registry.register(ApiKey::new(MODULE, "RedrawWindow"), RedrawWindow);
+    registry.register(ApiKey::new(MODULE, "BeginPaint"), BeginPaint);
+    registry.register(ApiKey::new(MODULE, "EndPaint"), EndPaint);
     registry.register(ApiKey::new(MODULE, "SetWindowLongA"), SetWindowLong);
     registry.register(ApiKey::new(MODULE, "SetWindowLongW"), SetWindowLong);
     registry.register(ApiKey::new(MODULE, "GetWindowLongA"), GetWindowLong);
@@ -210,6 +218,15 @@ pub fn register(registry: &mut ApiRegistry) {
     registry.register(ApiKey::new(MODULE, "DrawMenuBar"), DrawMenuBar);
     registry.register(ApiKey::new(MODULE, "SetMenu"), SetMenu);
     registry.register(ApiKey::new(MODULE, "GetMenu"), GetMenu);
+    registry.register(ApiKey::new(MODULE, "GetSubMenu"), GetSubMenu);
+    registry.register(
+        ApiKey::new(MODULE, "TrackPopupMenu"),
+        TrackPopupMenu { extended: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "TrackPopupMenuEx"),
+        TrackPopupMenu { extended: true },
+    );
     registry.register(
         ApiKey::new(MODULE, "GetWindowRect"),
         GetWindowRectangle { client: false },
@@ -241,6 +258,14 @@ pub fn register(registry: &mut ApiRegistry) {
     );
     registry.register(ApiKey::new(MODULE, "IsWindow"), IsWindow);
     registry.register(ApiKey::new(MODULE, "IsWindowVisible"), IsWindowVisible);
+    registry.register(
+        ApiKey::new(MODULE, "IsIconic"),
+        WindowShowState { iconic: true },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "IsZoomed"),
+        WindowShowState { iconic: false },
+    );
     registry.register(ApiKey::new(MODULE, "ShowWindow"), ShowWindow);
     registry.register(ApiKey::new(MODULE, "EnableWindow"), EnableWindow);
     registry.register(ApiKey::new(MODULE, "IsWindowEnabled"), IsWindowEnabled);
@@ -264,6 +289,44 @@ pub fn register(registry: &mut ApiRegistry) {
         WindowPlacement { set: false },
     );
     registry.register(ApiKey::new(MODULE, "SetFocus"), SetFocus);
+    registry.register(
+        ApiKey::new(MODULE, "SetForegroundWindow"),
+        SetForegroundWindow,
+    );
+    registry.register(
+        ApiKey::new(MODULE, "GetForegroundWindow"),
+        GetForegroundWindow,
+    );
+    registry.register(ApiKey::new(MODULE, "SetActiveWindow"), SetActiveWindow);
+    registry.register(ApiKey::new(MODULE, "GetActiveWindow"), GetForegroundWindow);
+    registry.register(
+        ApiKey::new(MODULE, "FindWindowA"),
+        FindWindow {
+            extended: false,
+            wide: false,
+        },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "FindWindowW"),
+        FindWindow {
+            extended: false,
+            wide: true,
+        },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "FindWindowExA"),
+        FindWindow {
+            extended: true,
+            wide: false,
+        },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "FindWindowExW"),
+        FindWindow {
+            extended: true,
+            wide: true,
+        },
+    );
     registry.register(ApiKey::new(MODULE, "DialogBoxParamA"), DialogBoxParamA);
     registry.register(ApiKey::new(MODULE, "EndDialog"), EndDialog);
     registry.register(ApiKey::new(MODULE, "DestroyWindow"), DestroyWindow);
@@ -614,10 +677,178 @@ struct SetCursorPos;
 struct GetCursorPos;
 
 #[derive(Debug, Clone, Copy)]
+struct GetKeyboardState;
+
+#[derive(Debug, Clone, Copy)]
+struct SetKeyboardState;
+
+#[derive(Debug, Clone, Copy)]
+struct GetKeyState;
+
+impl HostCallHandler for GetKeyboardState {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let output = GuestAddress(context.argument_u32(0)?);
+        let state = context.keyboard_state();
+        context.write_memory(output, &state)?;
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetKeyboardState {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let input = GuestAddress(context.argument_u32(0)?);
+        let mut state = [0; 256];
+        context.read_memory(input, &mut state)?;
+        context.set_keyboard_state(&state);
+        context.set_return_u32(1);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetKeyState {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let key = context.argument_u32(0)? as usize;
+        let byte = context.keyboard_state().get(key).copied().unwrap_or(0);
+        let result = (u16::from(byte & 0x80) << 8) | u16::from(byte & 1);
+        context.set_return_u32(u32::from(result));
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct UpdateWindow;
 
 #[derive(Debug, Clone, Copy)]
 struct InvalidateRect;
+
+#[derive(Debug, Clone, Copy)]
+struct ValidateRect;
+
+#[derive(Debug, Clone, Copy)]
+struct RedrawWindow;
+
+#[derive(Debug, Clone, Copy)]
+struct BeginPaint;
+
+#[derive(Debug, Clone, Copy)]
+struct EndPaint;
+
+fn request_window_paint(
+    context: &mut dyn HostCallContext,
+    window: u32,
+) -> Result<bool, Win32Error> {
+    const WM_PAINT: u32 = 0x000f;
+    if !context.window_needs_paint(window) {
+        return Ok(false);
+    }
+    if let Some(callback) = context.guest_callback_target(window) {
+        context.request_guest_callback(callback, &[window, WM_PAINT, 0, 0])?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+impl HostCallHandler for RedrawWindow {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        const RDW_INVALIDATE: u32 = 0x0001;
+        const RDW_VALIDATE: u32 = 0x0008;
+        const RDW_UPDATENOW: u32 = 0x0100;
+        const RDW_ERASENOW: u32 = 0x0200;
+        let window = context.argument_u32(0)?;
+        let rectangle = GuestAddress(context.argument_u32(1)?);
+        let _region = context.argument_u32(2)?;
+        let flags = context.argument_u32(3)?;
+        if rectangle.0 != 0 {
+            let mut bytes = [0; 16];
+            context.read_memory(rectangle, &mut bytes)?;
+        }
+        let windows = if window == 0 {
+            context.window_handles()
+        } else if context.is_window(window) {
+            vec![window]
+        } else {
+            Vec::new()
+        };
+        for window in &windows {
+            if flags & RDW_INVALIDATE != 0 {
+                context.invalidate_window(*window);
+            }
+            if flags & RDW_VALIDATE != 0 {
+                context.validate_window(*window);
+            }
+            if flags & (RDW_UPDATENOW | RDW_ERASENOW) != 0 {
+                request_window_paint(context, *window)?;
+            }
+        }
+        context.set_return_u32(u32::from(window == 0 || !windows.is_empty()));
+        context.set_stdcall_cleanup(16);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for BeginPaint {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let output = GuestAddress(context.argument_u32(1)?);
+        let Some(dc) = context.window_dc(window) else {
+            context.set_last_error(1400); // ERROR_INVALID_WINDOW_HANDLE
+            context.set_return_u32(0);
+            context.set_stdcall_cleanup(8);
+            return Ok(());
+        };
+        let placement = context
+            .window_placement(window)
+            .ok_or(Win32Error::InvalidArgument("missing window placement"))?;
+        let width = read_i32(&placement, 36)?.saturating_sub(read_i32(&placement, 28)?);
+        let height = read_i32(&placement, 40)?.saturating_sub(read_i32(&placement, 32)?);
+        let mut paint = [0; 64];
+        paint[0..4].copy_from_slice(&dc.to_le_bytes());
+        paint[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        paint[16..20].copy_from_slice(&width.to_le_bytes());
+        paint[20..24].copy_from_slice(&height.to_le_bytes());
+        context.write_memory(output, &paint)?;
+        context.validate_window(window);
+        context.set_last_error(0);
+        context.set_return_u32(dc);
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for EndPaint {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let paint = GuestAddress(context.argument_u32(1)?);
+        let mut bytes = [0; 64];
+        context.read_memory(paint, &mut bytes)?;
+        let dc = u32::from_le_bytes(bytes[0..4].try_into().expect("PAINTSTRUCT HDC"));
+        context.set_return_u32(u32::from(
+            context.is_window(window) && context.is_window_dc(dc),
+        ));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for ValidateRect {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let rectangle = GuestAddress(context.argument_u32(1)?);
+        if rectangle.0 != 0 {
+            let mut bytes = [0; 16];
+            context.read_memory(rectangle, &mut bytes)?;
+        }
+        context.validate_window(window);
+        context.set_return_u32(u32::from(context.is_window(window)));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct SetWindowLong;
@@ -660,16 +891,13 @@ impl HostCallHandler for GetWindowLong {
 
 impl HostCallHandler for UpdateWindow {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        const WM_PAINT: u32 = 0x000f;
         let window = context.argument_u32(0)?;
         if !context.is_window(window) {
             context.set_last_error(1400); // ERROR_INVALID_WINDOW_HANDLE
             context.set_return_u32(0);
         } else {
             context.set_return_u32(1);
-            if let Some(callback) = context.guest_callback_target(window) {
-                context.request_guest_callback(callback, &[window, WM_PAINT, 0, 0])?;
-            }
+            request_window_paint(context, window)?;
         }
         context.set_stdcall_cleanup(4);
         Ok(())
@@ -685,7 +913,8 @@ impl HostCallHandler for InvalidateRect {
             let mut bytes = [0; 16];
             context.read_memory(rectangle, &mut bytes)?;
         }
-        context.set_return_u32(u32::from(context.is_window(window)));
+        let invalidated = context.invalidate_window(window);
+        context.set_return_u32(u32::from(invalidated || context.is_window(window)));
         context.set_stdcall_cleanup(12);
         Ok(())
     }
@@ -1101,12 +1330,14 @@ impl HostCallHandler for SetCursor {
 
 impl HostCallHandler for GetDc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        if context.argument_u32(0)? != 0 {
-            return Err(Win32Error::Unsupported {
-                feature: "GetDC for a window",
-            });
-        }
-        context.set_return_u32(SCREEN_DC_HANDLE);
+        let window = context.argument_u32(0)?;
+        let dc = if window == 0 {
+            Some(SCREEN_DC_HANDLE)
+        } else {
+            context.window_dc(window)
+        };
+        context.set_return_u32(dc.unwrap_or(0));
+        context.set_last_error(if dc.is_some() { 0 } else { 1400 });
         context.set_stdcall_cleanup(4);
         Ok(())
     }
@@ -1119,7 +1350,9 @@ impl HostCallHandler for ReleaseDc {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let _window = context.argument_u32(0)?;
         let dc = context.argument_u32(1)?;
-        context.set_return_u32(u32::from(dc == SCREEN_DC_HANDLE));
+        context.set_return_u32(u32::from(
+            dc == SCREEN_DC_HANDLE || context.is_window_dc(dc),
+        ));
         context.set_stdcall_cleanup(8);
         Ok(())
     }
@@ -1296,6 +1529,46 @@ struct SetMenu;
 
 #[derive(Debug, Clone, Copy)]
 struct GetMenu;
+
+#[derive(Debug, Clone, Copy)]
+struct GetSubMenu;
+
+#[derive(Debug, Clone, Copy)]
+struct TrackPopupMenu {
+    extended: bool,
+}
+
+impl HostCallHandler for TrackPopupMenu {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let menu = context.argument_u32(0)?;
+        let _flags = context.argument_u32(1)?;
+        let _x = context.argument_u32(2)?;
+        let _y = context.argument_u32(3)?;
+        let window = context.argument_u32(4)?;
+        let cleanup = if self.extended { 24 } else { 28 };
+        if (menu == SYSTEM_MENU_HANDLE || context.is_menu(menu)) && context.is_window(window) {
+            // No native menu interaction is available yet; returning zero is
+            // the documented user-cancel result for both return modes.
+            context.set_last_error(0);
+            context.set_return_u32(0);
+        } else {
+            context.set_last_error(1401); // ERROR_INVALID_MENU_HANDLE
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(cleanup);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetSubMenu {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let menu = context.argument_u32(0)?;
+        let position = context.argument_u32(1)? as usize;
+        context.set_return_u32(context.submenu(menu, position).unwrap_or(0));
+        context.set_stdcall_cleanup(8);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct GetWindowRectangle {
@@ -1552,14 +1825,28 @@ struct InsertMenuItem;
 impl HostCallHandler for InsertMenuItem {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let menu = context.argument_u32(0)?;
-        let _item = context.argument_u32(1)?;
-        let _by_position = context.argument_u32(2)?;
+        let item = context.argument_u32(1)?;
+        let by_position = context.argument_u32(2)?;
         let info = GuestAddress(context.argument_u32(3)?);
         let mut header = [0; 8];
         context.read_memory(info, &mut header)?;
         let size = u32::from_le_bytes(header[0..4].try_into().expect("MENUITEMINFO size"));
+        let mut submenu = 0;
+        if matches!(size, 44 | 48) {
+            let mut bytes = vec![0; size as usize];
+            context.read_memory(info, &mut bytes)?;
+            submenu = u32::from_le_bytes(bytes[20..24].try_into().expect("hSubMenu"));
+        }
         let valid =
             (menu == SYSTEM_MENU_HANDLE || context.is_menu(menu)) && matches!(size, 44 | 48);
+        if valid && menu != SYSTEM_MENU_HANDLE {
+            let position = if by_position != 0 {
+                item as usize
+            } else {
+                usize::MAX
+            };
+            context.insert_submenu(menu, position, submenu);
+        }
         context.set_return_u32(u32::from(valid));
         if valid {
             context.set_last_error(0);
@@ -1697,6 +1984,28 @@ struct IsWindowVisible;
 
 #[derive(Debug, Clone, Copy)]
 struct ShowWindow;
+
+#[derive(Debug, Clone, Copy)]
+struct WindowShowState {
+    iconic: bool,
+}
+
+impl HostCallHandler for WindowShowState {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let show_command = context.window_placement(window).map_or(0, |placement| {
+            u32::from_le_bytes(placement[8..12].try_into().expect("show command"))
+        });
+        let matches = if self.iconic {
+            matches!(show_command, 2 | 6 | 7)
+        } else {
+            show_command == 3
+        };
+        context.set_return_u32(u32::from(matches));
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EnableWindow;
@@ -1987,6 +2296,10 @@ impl HostCallHandler for ShowWindow {
             context.set_return_u32(0);
         } else {
             let previous = context.set_window_visible(window, command != 0);
+            if let Some(mut placement) = context.window_placement(window) {
+                placement[8..12].copy_from_slice(&command.to_le_bytes());
+                context.set_window_placement(window, &placement);
+            }
             context.set_last_error(0);
             context.set_return_u32(u32::from(previous));
         }
@@ -2034,6 +2347,113 @@ impl HostCallHandler for SendMessageA {
 
 #[derive(Debug, Clone, Copy)]
 struct SetFocus;
+
+#[derive(Debug, Clone, Copy)]
+struct SetForegroundWindow;
+
+#[derive(Debug, Clone, Copy)]
+struct GetForegroundWindow;
+
+#[derive(Debug, Clone, Copy)]
+struct SetActiveWindow;
+
+#[derive(Debug, Clone, Copy)]
+struct FindWindow {
+    extended: bool,
+    wide: bool,
+}
+
+impl HostCallHandler for FindWindow {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let (parent, after, class_argument, title_argument, cleanup) = if self.extended {
+            (
+                context.argument_u32(0)?,
+                context.argument_u32(1)?,
+                context.argument_u32(2)?,
+                context.argument_u32(3)?,
+                16,
+            )
+        } else {
+            (0, 0, context.argument_u32(0)?, context.argument_u32(1)?, 8)
+        };
+        let class = if class_argument == 0 {
+            None
+        } else if class_argument <= u32::from(u16::MAX) {
+            context.window_class_name_by_atom(class_argument as u16)
+        } else if self.wide {
+            Some(read_utf16_z(context, GuestAddress(class_argument))?)
+        } else {
+            Some(read_ansi_z(context, GuestAddress(class_argument))?)
+        };
+        let title = if title_argument == 0 {
+            None
+        } else if self.wide {
+            Some(read_utf16_z(context, GuestAddress(title_argument))?)
+        } else {
+            Some(read_ansi_z(context, GuestAddress(title_argument))?)
+        };
+        let mut passed_after = after == 0;
+        let found = context.window_handles().into_iter().find(|window| {
+            if !passed_after {
+                passed_after = *window == after;
+                return false;
+            }
+            if parent != 0 && context.window_long(*window, -8).unwrap_or(0) != parent {
+                return false;
+            }
+            let class_matches = class.as_ref().is_none_or(|expected| {
+                context
+                    .window_class_name(*window)
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+            });
+            let title_matches = title.as_ref().is_none_or(|expected| {
+                context
+                    .window_title(*window)
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+            });
+            class_matches && title_matches
+        });
+        context.set_return_u32(found.unwrap_or(0));
+        context.set_stdcall_cleanup(cleanup);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetForegroundWindow {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        if context.is_window(window) {
+            context.replace_focus_window(window);
+            context.set_return_u32(1);
+        } else {
+            context.set_return_u32(0);
+        }
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for GetForegroundWindow {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_return_u32(context.focused_window());
+        context.set_stdcall_cleanup(0);
+        Ok(())
+    }
+}
+
+impl HostCallHandler for SetActiveWindow {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        let window = context.argument_u32(0)?;
+        let previous = if window == 0 || context.is_window(window) {
+            context.replace_focus_window(window)
+        } else {
+            0
+        };
+        context.set_return_u32(previous);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
+}
 
 impl HostCallHandler for SetFocus {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {

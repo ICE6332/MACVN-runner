@@ -31,11 +31,23 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) primary_display_size: &'a mut (u32, u32),
     pub(super) menus: &'a mut BTreeSet<u32>,
     pub(super) next_menu_handle: &'a mut u32,
+    pub(super) menu_children: &'a mut HashMap<u32, Vec<u32>>,
     pub(super) cursor_position: &'a mut (i32, i32),
     pub(super) window_menus: &'a mut HashMap<u32, u32>,
     pub(super) clipboard_open: &'a mut bool,
     pub(super) clipboard_data: &'a mut HashMap<u32, u32>,
     pub(super) window_longs: &'a mut HashMap<(u32, i32), u32>,
+    pub(super) invalidated_windows: &'a mut BTreeSet<u32>,
+    pub(super) window_dcs: &'a mut HashMap<u32, u32>,
+    pub(super) next_window_dc: &'a mut u32,
+    pub(super) keyboard_state: &'a mut [u8; 256],
+    pub(super) memory_dcs: &'a mut BTreeSet<u32>,
+    pub(super) next_memory_dc: &'a mut u32,
+    pub(super) selected_gdi_objects: &'a mut HashMap<u32, u32>,
+    pub(super) gdi_objects: &'a mut HashMap<u32, Vec<u8>>,
+    pub(super) next_gdi_object: &'a mut u32,
+    pub(super) gdi_dc_attributes: &'a mut HashMap<(u32, u32), u32>,
+    pub(super) window_frames: &'a mut HashMap<u32, WindowFrame>,
     pub(super) next_window_handle: &'a mut u32,
     pub(super) image_base: GuestAddress,
     pub(super) resource_directory: Option<(GuestAddress, u32)>,
@@ -75,6 +87,65 @@ impl RuntimeHostContext<'_> {
         self.cpu.state.registers.eip = return_address;
         Ok(())
     }
+}
+
+fn store_dib_frame(
+    context: &mut RuntimeHostContext<'_>,
+    destination: u32,
+    width: u32,
+    signed_height: i32,
+    stride: u32,
+    bits_per_pixel: u16,
+    pixels: GuestAddress,
+) -> Result<bool, Win32Error> {
+    let Some(window) = context
+        .window_dcs
+        .iter()
+        .find_map(|(window, dc)| (*dc == destination).then_some(*window))
+    else {
+        return Ok(false);
+    };
+    let height = signed_height.unsigned_abs();
+    if width == 0 || height == 0 || pixels.0 == 0 || !matches!(bits_per_pixel, 24 | 32) {
+        return Ok(false);
+    }
+    let byte_count = stride
+        .checked_mul(height)
+        .filter(|size| *size <= 256 * 1024 * 1024)
+        .ok_or(Win32Error::InvalidArgument("presented bitmap size"))?;
+    let mut source_bytes = vec![0; byte_count as usize];
+    context.read_memory(pixels, &mut source_bytes)?;
+    let output_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(Win32Error::InvalidArgument("presented RGBA size"))?;
+    let mut rgba = vec![0; output_len as usize];
+    let source_pixel_size = usize::from(bits_per_pixel / 8);
+    for y in 0..height as usize {
+        let source_y = if signed_height > 0 {
+            height as usize - 1 - y
+        } else {
+            y
+        };
+        let row_start = source_y * stride as usize;
+        for x in 0..width as usize {
+            let source_offset = row_start + x * source_pixel_size;
+            let output_offset = (y * width as usize + x) * 4;
+            rgba[output_offset] = source_bytes[source_offset + 2];
+            rgba[output_offset + 1] = source_bytes[source_offset + 1];
+            rgba[output_offset + 2] = source_bytes[source_offset];
+            rgba[output_offset + 3] = 255;
+        }
+    }
+    context.window_frames.insert(
+        window,
+        WindowFrame {
+            width,
+            height,
+            rgba,
+        },
+    );
+    Ok(true)
 }
 
 impl HostCallContext for RuntimeHostContext<'_> {
@@ -156,6 +227,10 @@ impl HostCallContext for RuntimeHostContext<'_> {
         std::mem::replace(self.focused_window, window)
     }
 
+    fn focused_window(&self) -> u32 {
+        *self.focused_window
+    }
+
     fn replace_window_class_long(&mut self, window: u32, index: i32, value: u32) -> u32 {
         self.window_class_longs
             .insert((window, index), value)
@@ -216,6 +291,7 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.window_titles.insert(handle, title.to_owned());
         if visible {
             self.visible_windows.insert(handle);
+            self.invalidated_windows.insert(handle);
         }
         handle
     }
@@ -246,6 +322,8 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.window_class_longs
             .retain(|(hwnd, _), _| *hwnd != window);
         self.window_longs.retain(|(hwnd, _), _| *hwnd != window);
+        self.invalidated_windows.remove(&window);
+        self.window_dcs.remove(&window);
         self.guest_callback_targets.remove(&window);
         self.windows.remove(&window).is_some()
     }
@@ -355,6 +433,7 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn destroy_menu(&mut self, menu: u32) -> bool {
+        self.menu_children.remove(&menu);
         self.menus.remove(&menu)
     }
 
@@ -362,8 +441,28 @@ impl HostCallContext for RuntimeHostContext<'_> {
         self.menus.contains(&menu)
     }
 
+    fn insert_submenu(&mut self, menu: u32, position: usize, submenu: u32) -> bool {
+        if !self.menus.contains(&menu) {
+            return false;
+        }
+        let children = self.menu_children.entry(menu).or_default();
+        let position = position.min(children.len());
+        children.insert(position, submenu);
+        true
+    }
+
+    fn submenu(&self, menu: u32, position: usize) -> Option<u32> {
+        self.menu_children
+            .get(&menu)
+            .and_then(|children| children.get(position))
+            .copied()
+            .filter(|submenu| *submenu != 0)
+    }
+
     fn window_handles(&self) -> Vec<u32> {
-        self.windows.keys().copied().collect()
+        let mut windows = self.windows.keys().copied().collect::<Vec<_>>();
+        windows.sort_unstable();
+        windows
     }
 
     fn cursor_position(&self) -> (i32, i32) {
@@ -432,6 +531,170 @@ impl HostCallContext for RuntimeHostContext<'_> {
                 .copied()
                 .unwrap_or(0)
         })
+    }
+
+    fn invalidate_window(&mut self, window: u32) -> bool {
+        self.windows.contains_key(&window) && self.invalidated_windows.insert(window)
+    }
+
+    fn validate_window(&mut self, window: u32) -> bool {
+        self.windows.contains_key(&window) && self.invalidated_windows.remove(&window)
+    }
+
+    fn window_needs_paint(&self, window: u32) -> bool {
+        self.windows.contains_key(&window) && self.invalidated_windows.contains(&window)
+    }
+
+    fn window_dc(&mut self, window: u32) -> Option<u32> {
+        if !self.windows.contains_key(&window) {
+            return None;
+        }
+        if let Some(dc) = self.window_dcs.get(&window).copied() {
+            return Some(dc);
+        }
+        let dc = *self.next_window_dc;
+        *self.next_window_dc = self.next_window_dc.wrapping_add(4);
+        self.window_dcs.insert(window, dc);
+        Some(dc)
+    }
+
+    fn is_window_dc(&self, dc: u32) -> bool {
+        self.window_dcs.values().any(|candidate| *candidate == dc)
+    }
+
+    fn keyboard_state(&self) -> [u8; 256] {
+        *self.keyboard_state
+    }
+
+    fn set_keyboard_state(&mut self, state: &[u8; 256]) {
+        *self.keyboard_state = *state;
+    }
+
+    fn is_gdi_dc(&self, dc: u32) -> bool {
+        dc == 0x0003_0000
+            || self.window_dcs.values().any(|candidate| *candidate == dc)
+            || self.memory_dcs.contains(&dc)
+    }
+
+    fn create_memory_dc(&mut self, source: u32) -> Option<u32> {
+        if source != 0 && !self.is_gdi_dc(source) {
+            return None;
+        }
+        let dc = *self.next_memory_dc;
+        *self.next_memory_dc = self.next_memory_dc.wrapping_add(4);
+        self.memory_dcs.insert(dc);
+        Some(dc)
+    }
+
+    fn delete_memory_dc(&mut self, dc: u32) -> bool {
+        self.selected_gdi_objects.remove(&dc);
+        self.gdi_dc_attributes
+            .retain(|(candidate, _), _| *candidate != dc);
+        self.memory_dcs.remove(&dc)
+    }
+
+    fn select_gdi_object(&mut self, dc: u32, object: u32) -> Option<u32> {
+        if !self.is_gdi_dc(dc) || object == 0 {
+            return None;
+        }
+        Some(self.selected_gdi_objects.insert(dc, object).unwrap_or(0))
+    }
+
+    fn selected_gdi_object(&self, dc: u32) -> Option<u32> {
+        self.selected_gdi_objects.get(&dc).copied()
+    }
+
+    fn create_gdi_object(&mut self, descriptor: &[u8]) -> u32 {
+        let object = *self.next_gdi_object;
+        *self.next_gdi_object = self.next_gdi_object.wrapping_add(4);
+        self.gdi_objects.insert(object, descriptor.to_vec());
+        object
+    }
+
+    fn gdi_object(&self, object: u32) -> Option<Vec<u8>> {
+        self.gdi_objects.get(&object).cloned()
+    }
+
+    fn delete_gdi_object(&mut self, object: u32) -> bool {
+        if self
+            .selected_gdi_objects
+            .values()
+            .any(|selected| *selected == object)
+        {
+            return false;
+        }
+        self.gdi_objects.remove(&object).is_some()
+    }
+
+    fn replace_gdi_dc_attribute(
+        &mut self,
+        dc: u32,
+        attribute: u32,
+        value: u32,
+        default: u32,
+    ) -> Option<u32> {
+        if !self.is_gdi_dc(dc) {
+            return None;
+        }
+        Some(
+            self.gdi_dc_attributes
+                .insert((dc, attribute), value)
+                .unwrap_or(default),
+        )
+    }
+
+    fn present_selected_bitmap(
+        &mut self,
+        destination: u32,
+        source: u32,
+    ) -> Result<bool, Win32Error> {
+        let Some(object) = self.selected_gdi_objects.get(&source).copied() else {
+            return Ok(false);
+        };
+        let Some(descriptor) = self.gdi_objects.get(&object) else {
+            return Ok(false);
+        };
+        if descriptor.len() < 24 {
+            return Ok(false);
+        }
+        let width = u32::from_le_bytes(descriptor[4..8].try_into().expect("bitmap width"));
+        let signed_height =
+            i32::from_le_bytes(descriptor[8..12].try_into().expect("bitmap height"));
+        let stride = u32::from_le_bytes(descriptor[12..16].try_into().expect("bitmap stride"));
+        let bits_per_pixel =
+            u16::from_le_bytes(descriptor[18..20].try_into().expect("bitmap depth"));
+        let pixels = GuestAddress(u32::from_le_bytes(
+            descriptor[20..24].try_into().expect("bitmap pixels"),
+        ));
+        store_dib_frame(
+            self,
+            destination,
+            width,
+            signed_height,
+            stride,
+            bits_per_pixel,
+            pixels,
+        )
+    }
+
+    fn present_dib(
+        &mut self,
+        destination: u32,
+        width: u32,
+        height: i32,
+        stride: u32,
+        bits_per_pixel: u16,
+        pixels: GuestAddress,
+    ) -> Result<bool, Win32Error> {
+        store_dib_frame(
+            self,
+            destination,
+            width,
+            height,
+            stride,
+            bits_per_pixel,
+            pixels,
+        )
     }
 
     fn set_window_region(&mut self, window: u32, region: u32) {

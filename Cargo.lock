@@ -486,6 +486,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vnrt-comctl32"
+version = "0.1.0"
+dependencies = [
+ "vnrt-win32",
+]
+
+[[package]]
 name = "vnrt-debugger"
 version = "0.1.0"
 dependencies = [
@@ -501,6 +508,13 @@ name = "vnrt-gdi32"
 version = "0.1.0"
 dependencies = [
  "vnrt-user32",
+ "vnrt-win32",
+]
+
+[[package]]
+name = "vnrt-imm32"
+version = "0.1.0"
+dependencies = [
  "vnrt-win32",
 ]
 
@@ -571,8 +585,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vnrt-advapi32",
+ "vnrt-comctl32",
  "vnrt-debugger",
  "vnrt-gdi32",
+ "vnrt-imm32",
  "vnrt-kernel32",
  "vnrt-ntdll",
  "vnrt-ole32",
@@ -580,6 +596,7 @@ dependencies = [
  "vnrt-runtime",
  "vnrt-shell32",
  "vnrt-user32",
+ "vnrt-version",
  "vnrt-win32",
  "vnrt-winmm",
 ]
@@ -612,6 +629,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "tracing",
+ "vnrt-win32",
+]
+
+[[package]]
+name = "vnrt-version"
+version = "0.1.0"
+dependencies = [
  "vnrt-win32",
 ]
 

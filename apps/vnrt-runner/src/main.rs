@@ -35,13 +35,16 @@ fn main() -> Result<ExitCode> {
 
     let mut registry = ApiRegistry::new();
     vnrt_advapi32::register(&mut registry);
+    vnrt_comctl32::register(&mut registry);
     vnrt_gdi32::register(&mut registry);
+    vnrt_imm32::register(&mut registry);
     vnrt_kernel32::register(&mut registry);
     vnrt_ntdll::register(&mut registry);
     vnrt_ole32::register(&mut registry);
     vnrt_psapi::register(&mut registry);
     vnrt_shell32::register(&mut registry);
     vnrt_user32::register(&mut registry);
+    vnrt_version::register(&mut registry);
     vnrt_winmm::register(&mut registry);
     let file_name = arguments
         .path

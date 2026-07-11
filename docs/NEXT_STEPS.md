@@ -108,12 +108,13 @@ amount of compatibility surface, rather than broad Windows coverage.
 
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes,
 the NTDLL export census is resolved, and an unpacked child image is mapped near
-`0x70100000`. The invalid indirect-target failure has been traced and removed.
-The child has finished the observed Kernel32 resolution pass and is now deep in
-the User32 imports. Window-class registration, Guest window objects,
-`CreateWindowEx`, WndProc callbacks, and the initial message queue are modeled.
-Continue from the current `RedrawWindow` probe until the import census completes
-and the first actual window-creation call reaches the native backend boundary.
+`0x70100000`. The child has crossed the observed Kernel32, User32, GDI32,
+Shell32, Advapi32, COMCTL32, Ole32, WinMM, IMM32, and Version import passes.
+Window-class registration, Guest window objects, WndProc callbacks, painting,
+the initial message queue, DIB transfer, and RGBA frame capture are modeled.
+The current boundary is `d3d9.dll`; build the minimum Direct3D 9 COM object,
+surface/texture locking, and `Present` path required by the target, then connect
+captured frames to the SDL3 native backend.
 
 ## Following target milestone: complete target and first real window
 
@@ -121,7 +122,7 @@ The import census has exposed thread and file-mapping APIs. Their current
 facades distinguish export availability from runtime support, but real calls
 must gain proper object lifetime and Guest scheduling semantics.
 
-1. Finish target-driven Kernel32 resolution without broad speculative coverage.
+1. Implement the target-observed Direct3D 9 creation and presentation path.
 2. Implement cooperative Guest thread contexts if `CreateThread` is actually
    invoked, including stacks, TLS, suspend counts, exit codes, and waits.
 3. Grow the User32 surface only from executed failures until `CreateWindowExA`,
