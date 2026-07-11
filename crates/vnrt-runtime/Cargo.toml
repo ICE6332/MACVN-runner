@@ -1,0 +1,26 @@
+[package]
+name = "vnrt-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+sdl3-backend = ["dep:sdl3"]
+
+[dependencies]
+sdl3 = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+vnrt-memory = { path = "../vnrt-memory" }
+vnrt-pe = { path = "../vnrt-pe" }
+vnrt-win32 = { path = "../vnrt-win32" }
+vnrt-x86 = { path = "../vnrt-x86" }
+
+[dev-dependencies]
+vnrt-kernel32 = { path = "../vnrt-kernel32" }
+
+[lints]
+workspace = true

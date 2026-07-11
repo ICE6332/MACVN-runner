@@ -1,0 +1,13 @@
+[package]
+name = "vnrt-gdi32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vnrt-user32 = { path = "../vnrt-user32" }
+vnrt-win32 = { path = "../vnrt-win32" }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "vnrt-win32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+vnrt-memory = { path = "../vnrt-memory" }
+
+[lints]
+workspace = true

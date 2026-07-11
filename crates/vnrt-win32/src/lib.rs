@@ -1,0 +1,994 @@
+//! Win32-facing state and the host-call registry.
+//!
+//! API handlers work through [`HostCallContext`], so this crate does not need to
+//! own or depend on the x86 interpreter.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::debug;
+pub use vnrt_memory::GuestAddress;
+
+/// Default safety limit for NUL-terminated guest strings.
+pub const MAX_GUEST_STRING_BYTES: usize = 32 * 1024;
+/// Stable pseudo handle used for the initial process heap.
+pub const PROCESS_HEAP_HANDLE: u32 = 0x0001_0000;
+
+/// Opaque 32-bit value visible to guest code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Handle(pub u32);
+
+/// Generic owner for host resources referenced by guest handles.
+#[derive(Debug)]
+pub struct HandleTable<T> {
+    next: u32,
+    entries: HashMap<Handle, T>,
+}
+
+impl<T> Default for HandleTable<T> {
+    fn default() -> Self {
+        Self {
+            next: 4,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<T> HandleTable<T> {
+    /// Insert a value and allocate a non-null handle.
+    pub fn insert(&mut self, value: T) -> Result<Handle, Win32Error> {
+        let handle = Handle(self.next);
+        self.next = self
+            .next
+            .checked_add(4)
+            .ok_or(Win32Error::HandleExhausted)?;
+        self.entries.insert(handle, value);
+        Ok(handle)
+    }
+
+    /// Borrow the resource referenced by a handle.
+    #[must_use]
+    pub fn get(&self, handle: Handle) -> Option<&T> {
+        self.entries.get(&handle)
+    }
+
+    /// Mutably borrow the resource referenced by a handle.
+    pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
+        self.entries.get_mut(&handle)
+    }
+
+    /// Remove and return a resource.
+    pub fn remove(&mut self, handle: Handle) -> Option<T> {
+        self.entries.remove(&handle)
+    }
+
+    /// Number of live handles.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no handles are live.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// A guest-loaded module tracked by the compatibility layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Module {
+    /// Normalized module name.
+    pub name: String,
+    /// Guest load base.
+    pub base: GuestAddress,
+    /// Mapped image size.
+    pub size: u32,
+}
+
+/// Loaded-module lookup by normalized ASCII name.
+#[derive(Debug, Default)]
+pub struct ModuleTable {
+    modules: HashMap<String, Module>,
+}
+
+impl ModuleTable {
+    /// Add or replace a module record.
+    pub fn insert(&mut self, mut module: Module) {
+        module.name.make_ascii_lowercase();
+        self.modules.insert(module.name.clone(), module);
+    }
+
+    /// Find a module case-insensitively.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Module> {
+        self.modules.get(&name.to_ascii_lowercase())
+    }
+}
+
+/// Minimal filesystem boundary used by file-oriented Win32 APIs.
+pub trait VirtualFileSystem: Send + Sync {
+    /// Read the complete contents of a guest-visible path.
+    fn read(&self, path: &str) -> Result<Vec<u8>, Win32Error>;
+    /// Replace a guest-visible file.
+    fn write(&self, path: &str, bytes: &[u8]) -> Result<(), Win32Error>;
+    /// Enumerate entries matching one guest-relative wildcard pattern.
+    fn list(&self, pattern: &str) -> Result<Vec<FileEntry>, Win32Error>;
+}
+
+/// Metadata returned by the VFS directory enumeration boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Final path component visible to the Guest.
+    pub name: String,
+    /// Exact byte size for regular files.
+    pub size: u64,
+    /// Whether this entry is a directory.
+    pub is_directory: bool,
+}
+
+/// Filesystem implementation used until sandbox path mapping is configured.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnsupportedFileSystem;
+
+impl VirtualFileSystem for UnsupportedFileSystem {
+    fn read(&self, _path: &str) -> Result<Vec<u8>, Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem reads",
+        })
+    }
+
+    fn write(&self, _path: &str, _bytes: &[u8]) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem writes",
+        })
+    }
+
+    fn list(&self, _pattern: &str) -> Result<Vec<FileEntry>, Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem enumeration",
+        })
+    }
+}
+
+/// Host-backed filesystem constrained to one explicit root directory.
+#[derive(Debug, Clone)]
+pub struct SandboxFileSystem {
+    root: PathBuf,
+    guest_root: String,
+}
+
+impl SandboxFileSystem {
+    /// Create a filesystem rooted at `root`.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>, guest_root: impl Into<String>) -> Self {
+        let guest_root = guest_root.into().replace('\\', "/");
+        Self {
+            root: root.into(),
+            guest_root: guest_root.trim_end_matches('/').to_ascii_lowercase(),
+        }
+    }
+
+    fn resolve(&self, guest_path: &str) -> Result<PathBuf, Win32Error> {
+        let normalized = self.relative_guest_path(guest_path)?;
+        let mut relative = PathBuf::new();
+        for component in Path::new(&normalized).components() {
+            match component {
+                Component::Normal(part) => relative.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(Win32Error::InvalidArgument(
+                        "guest path escapes the filesystem root",
+                    ));
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            return Err(Win32Error::InvalidArgument("empty guest path"));
+        }
+        Ok(self.root.join(relative))
+    }
+
+    fn relative_guest_path(&self, guest_path: &str) -> Result<String, Win32Error> {
+        let normalized = guest_path.replace('\\', "/");
+        let normalized = normalized
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        if guest_path.starts_with(['/', '\\']) {
+            return Err(Win32Error::InvalidArgument("absolute guest path"));
+        }
+        if normalized.contains(':') {
+            let lower = normalized.to_ascii_lowercase();
+            if lower == self.guest_root {
+                return Err(Win32Error::InvalidArgument("empty guest path"));
+            }
+            let prefix = format!("{}/", self.guest_root);
+            return lower
+                .starts_with(&prefix)
+                .then(|| normalized[prefix.len()..].to_owned())
+                .ok_or(Win32Error::InvalidArgument(
+                    "drive-qualified guest path is outside the Guest root",
+                ));
+        }
+        Ok(normalized)
+    }
+
+    fn resolve_existing(&self, guest_path: &str) -> Result<PathBuf, Win32Error> {
+        let resolved = self.resolve(guest_path)?;
+        let relative = resolved.strip_prefix(&self.root).map_err(|_| {
+            Win32Error::InvalidArgument("resolved guest path is outside filesystem root")
+        })?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(Win32Error::InvalidArgument(
+                    "invalid resolved guest path component",
+                ));
+            };
+            let exact = current.join(name);
+            if exact.exists() {
+                current = exact;
+                continue;
+            }
+            let requested = name.to_string_lossy();
+            let matched = fs::read_dir(&current)
+                .ok()
+                .and_then(|entries| {
+                    entries.filter_map(Result::ok).find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&requested)
+                    })
+                })
+                .map(|entry| entry.path())
+                .ok_or_else(|| Win32Error::Io {
+                    operation: "resolve",
+                    path: guest_path.to_owned(),
+                    message: "path does not exist".to_owned(),
+                })?;
+            current = matched;
+        }
+        Ok(current)
+    }
+}
+
+impl VirtualFileSystem for SandboxFileSystem {
+    fn read(&self, path: &str) -> Result<Vec<u8>, Win32Error> {
+        let resolved = self.resolve_existing(path)?;
+        fs::read(&resolved).map_err(|error| Win32Error::Io {
+            operation: "read",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn write(&self, path: &str, bytes: &[u8]) -> Result<(), Win32Error> {
+        let resolved = self.resolve(path)?;
+        fs::write(&resolved, bytes).map_err(|error| Win32Error::Io {
+            operation: "write",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn list(&self, pattern: &str) -> Result<Vec<FileEntry>, Win32Error> {
+        let normalized = self.relative_guest_path(pattern)?;
+        let (directory, wildcard) = normalized
+            .rsplit_once('/')
+            .map_or(("", normalized.as_str()), |(directory, wildcard)| {
+                (directory, wildcard)
+            });
+        if wildcard.is_empty() {
+            return Err(Win32Error::InvalidArgument("empty search wildcard"));
+        }
+        let resolved = if directory.is_empty() || directory == "." {
+            self.root.clone()
+        } else {
+            self.resolve_existing(directory)?
+        };
+        let entries = fs::read_dir(&resolved).map_err(|error| Win32Error::Io {
+            operation: "enumerate",
+            path: pattern.to_owned(),
+            message: error.to_string(),
+        })?;
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| Win32Error::Io {
+                operation: "enumerate",
+                path: pattern.to_owned(),
+                message: error.to_string(),
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !wildcard_matches(wildcard, &name) {
+                continue;
+            }
+            let metadata = entry.metadata().map_err(|error| Win32Error::Io {
+                operation: "metadata",
+                path: name.clone(),
+                message: error.to_string(),
+            })?;
+            matches.push(FileEntry {
+                name,
+                size: metadata.len(),
+                is_directory: metadata.is_dir(),
+            });
+        }
+        matches.sort_by_key(|entry| entry.name.to_ascii_lowercase());
+        Ok(matches)
+    }
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase().into_bytes();
+    let value = value.to_ascii_lowercase().into_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star, mut retry_value) = (None, 0);
+    while value_index < value.len() {
+        if pattern
+            .get(pattern_index)
+            .is_some_and(|byte| *byte == b'?' || Some(byte) == value.get(value_index))
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            retry_value = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            retry_value += 1;
+            value_index = retry_value;
+        } else {
+            return false;
+        }
+    }
+    while pattern.get(pattern_index) == Some(&b'*') {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+struct OpenFile {
+    bytes: Vec<u8>,
+    cursor: usize,
+}
+
+struct DirectorySearch {
+    remaining: VecDeque<FileEntry>,
+}
+
+/// Per-process file handles and read cursors over the configured VFS.
+pub struct ProcessIo {
+    filesystem: Arc<dyn VirtualFileSystem>,
+    files: HandleTable<OpenFile>,
+    searches: HashMap<Handle, DirectorySearch>,
+    next_search_handle: u32,
+}
+
+impl ProcessIo {
+    /// Create process I/O using a sandboxed host directory.
+    #[must_use]
+    pub fn sandboxed(root: impl Into<PathBuf>, guest_root: impl Into<String>) -> Self {
+        Self {
+            filesystem: Arc::new(SandboxFileSystem::new(root, guest_root)),
+            files: HandleTable::default(),
+            searches: HashMap::new(),
+            next_search_handle: 0x0004_0000,
+        }
+    }
+
+    /// Open a guest path for sequential reading.
+    pub fn open_read(&mut self, path: &str) -> Result<Handle, Win32Error> {
+        let bytes = self.filesystem.read(path)?;
+        self.files.insert(OpenFile { bytes, cursor: 0 })
+    }
+
+    /// Read at most `length` bytes and advance the file cursor.
+    pub fn read(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error> {
+        let file = self
+            .files
+            .get_mut(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        if file.cursor >= file.bytes.len() {
+            return Ok(Vec::new());
+        }
+        let end = file.cursor.saturating_add(length).min(file.bytes.len());
+        let bytes = file.bytes[file.cursor..end].to_vec();
+        file.cursor = end;
+        Ok(bytes)
+    }
+
+    /// Close a file handle.
+    pub fn close(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        self.files
+            .remove(handle)
+            .map(|_| ())
+            .ok_or(Win32Error::InvalidHandle(handle.0))
+    }
+
+    /// Start a wildcard directory search and return its first result.
+    pub fn find_first(&mut self, pattern: &str) -> Result<(Handle, FileEntry), Win32Error> {
+        debug!(pattern, "guest wildcard search requested");
+        let mut entries = VecDeque::from(self.filesystem.list(pattern)?);
+        debug!(pattern, matches = entries.len(), "guest wildcard search");
+        let first = entries.pop_front().ok_or_else(|| Win32Error::Io {
+            operation: "enumerate",
+            path: pattern.to_owned(),
+            message: "no matching files".to_owned(),
+        })?;
+        let handle = Handle(self.next_search_handle);
+        self.next_search_handle = self
+            .next_search_handle
+            .checked_add(4)
+            .ok_or(Win32Error::HandleExhausted)?;
+        self.searches
+            .insert(handle, DirectorySearch { remaining: entries });
+        Ok((handle, first))
+    }
+
+    /// Advance an existing wildcard directory search.
+    pub fn find_next(&mut self, handle: Handle) -> Result<Option<FileEntry>, Win32Error> {
+        self.searches
+            .get_mut(&handle)
+            .map(|search| search.remaining.pop_front())
+            .ok_or(Win32Error::InvalidHandle(handle.0))
+    }
+
+    /// Close a wildcard directory search.
+    pub fn close_search(&mut self, handle: Handle) -> Result<(), Win32Error> {
+        self.searches
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or(Win32Error::InvalidHandle(handle.0))
+    }
+
+    /// Total byte length of an open file.
+    pub fn file_size(&self, handle: Handle) -> Result<u64, Win32Error> {
+        let file = self
+            .files
+            .get(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        u64::try_from(file.bytes.len())
+            .map_err(|_| Win32Error::InvalidArgument("file size exceeds u64"))
+    }
+
+    /// Move an open file cursor relative to start, current position, or end.
+    pub fn seek(&mut self, handle: Handle, distance: i64, origin: u32) -> Result<u64, Win32Error> {
+        let file = self
+            .files
+            .get_mut(handle)
+            .ok_or(Win32Error::InvalidHandle(handle.0))?;
+        let base = match origin {
+            0 => 0,
+            1 => i64::try_from(file.cursor)
+                .map_err(|_| Win32Error::InvalidArgument("file cursor exceeds i64"))?,
+            2 => i64::try_from(file.bytes.len())
+                .map_err(|_| Win32Error::InvalidArgument("file size exceeds i64"))?,
+            _ => return Err(Win32Error::InvalidArgument("invalid file seek origin")),
+        };
+        let position = base
+            .checked_add(distance)
+            .filter(|position| *position >= 0)
+            .ok_or(Win32Error::InvalidArgument(
+                "negative or overflowing file seek",
+            ))?;
+        file.cursor = usize::try_from(position)
+            .map_err(|_| Win32Error::InvalidArgument("file seek exceeds host usize"))?;
+        Ok(position as u64)
+    }
+
+    /// Whether a handle refers to an open disk file.
+    #[must_use]
+    pub fn contains(&self, handle: Handle) -> bool {
+        self.files.get(handle).is_some()
+    }
+
+    /// Number of currently open file handles.
+    #[must_use]
+    pub fn open_handle_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// Stable name of a host-implemented imported API.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApiKey {
+    /// Lowercase module name without path assumptions.
+    pub module: String,
+    /// Export name.
+    pub name: String,
+}
+
+impl ApiKey {
+    /// Construct and normalize an API key.
+    #[must_use]
+    pub fn new(module: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            module: module.into().to_ascii_lowercase(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Narrow machine interface exposed to Win32 host-call handlers.
+pub trait HostCallContext {
+    /// Read a 32-bit stdcall argument, excluding the return address.
+    fn argument_u32(&self, index: usize) -> Result<u32, Win32Error>;
+    /// Store the conventional 32-bit return value in EAX.
+    fn set_return_u32(&mut self, value: u32);
+    /// Declare how many argument bytes the stdcall callee removes on return.
+    fn set_stdcall_cleanup(&mut self, argument_bytes: u32);
+    /// Enter a Guest stdcall callback before the current Host call returns.
+    fn request_guest_callback(
+        &mut self,
+        callback: GuestAddress,
+        arguments: &[u32],
+    ) -> Result<(), Win32Error>;
+    /// Use the final queued Guest callback's EAX as the suspended Host return value.
+    fn use_guest_callback_return_value(&mut self);
+    /// Finish the suspended Host call after the active Guest callback returns.
+    fn complete_suspended_host_call(&mut self, return_value: u32) -> Result<(), Win32Error>;
+    /// Associate a Guest callback with an opaque Win32 object handle.
+    fn register_guest_callback_target(&mut self, object: u32, callback: GuestAddress);
+    /// Look up the Guest callback associated with an opaque Win32 object handle.
+    fn guest_callback_target(&self, object: u32) -> Option<GuestAddress>;
+    /// Replace the focused Guest window and return the previous handle.
+    fn replace_focus_window(&mut self, window: u32) -> u32;
+    /// Read guest bytes for string and structure arguments.
+    fn read_memory(&self, address: GuestAddress, output: &mut [u8]) -> Result<(), Win32Error>;
+    /// Write guest output data.
+    fn write_memory(&mut self, address: GuestAddress, bytes: &[u8]) -> Result<(), Win32Error>;
+    /// Request clean process termination.
+    fn request_exit(&mut self, code: u32);
+    /// Milliseconds elapsed on the runtime's monotonic process clock.
+    fn tick_count(&self) -> u32;
+    /// Nanosecond-frequency monotonic performance-counter value.
+    fn performance_counter(&self) -> u64;
+    /// Number of performance-counter ticks per second.
+    fn performance_frequency(&self) -> u64;
+    /// Current UTC time as 100-nanosecond intervals since 1601-01-01.
+    fn system_time_filetime(&self) -> u64;
+    /// Create a private process heap and return its opaque guest handle.
+    fn create_heap(
+        &mut self,
+        initial_size: u32,
+        maximum_size: u32,
+        executable: bool,
+    ) -> Result<Handle, Win32Error>;
+    /// Destroy a private heap and all allocations it still owns.
+    fn destroy_heap(&mut self, heap: Handle) -> Result<(), Win32Error>;
+    /// Allocate zero-initialized, read/write memory owned by `heap`.
+    fn allocate_heap_memory(&mut self, heap: Handle, size: u32)
+    -> Result<GuestAddress, Win32Error>;
+    /// Replace one heap allocation, preserving its existing prefix.
+    fn reallocate_heap_memory(
+        &mut self,
+        heap: Handle,
+        address: GuestAddress,
+        size: u32,
+    ) -> Result<GuestAddress, Win32Error>;
+    /// Release an allocation owned by `heap`.
+    fn free_heap_memory(&mut self, heap: Handle, address: GuestAddress) -> Result<(), Win32Error>;
+    /// Return the requested byte size of an allocation owned by `heap`.
+    fn heap_memory_size(&self, heap: Handle, address: GuestAddress) -> Result<u32, Win32Error>;
+    /// Allocate and track one legacy global-memory object.
+    fn allocate_global_memory(&mut self, size: u32) -> Result<Handle, Win32Error>;
+    /// Lock a global-memory object and return its Guest pointer.
+    fn lock_global_memory(&mut self, handle: Handle) -> Result<GuestAddress, Win32Error>;
+    /// Unlock a global-memory object and return whether it remains locked.
+    fn unlock_global_memory(&mut self, handle: Handle) -> Result<bool, Win32Error>;
+    /// Free one global-memory object.
+    fn free_global_memory(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Allocate one process-wide TLS index for the current thread's slot array.
+    fn allocate_tls_index(&mut self) -> Result<u32, Win32Error>;
+    /// Release a dynamically allocated TLS index.
+    fn free_tls_index(&mut self, index: u32) -> Result<(), Win32Error>;
+    /// Read the current thread's value for an allocated TLS index.
+    fn tls_value(&self, index: u32) -> Result<u32, Win32Error>;
+    /// Set the current thread's value for an allocated TLS index.
+    fn set_tls_value(&mut self, index: u32, value: u32) -> Result<(), Win32Error>;
+    /// Replace the process top-level exception filter and return its old pointer.
+    fn replace_unhandled_exception_filter(&mut self, filter: u32) -> u32;
+    /// Enter the initial thread's simplified COM apartment and return HRESULT.
+    fn initialize_com(&mut self) -> u32;
+    /// Balance one successful COM apartment initialization.
+    fn uninitialize_com(&mut self);
+    /// Adjust and return the current thread's ShowCursor display count.
+    fn adjust_cursor_display_count(&mut self, show: bool) -> i32;
+    /// Preferred base of the main executable image.
+    fn main_module_base(&self) -> GuestAddress;
+    /// Mapped PE resource directory root and byte size, when present.
+    fn resource_directory(&self) -> Option<(GuestAddress, u32)>;
+    /// Allocate a committed virtual-memory region outside the process heap.
+    fn allocate_virtual_memory(
+        &mut self,
+        size: u32,
+        read: bool,
+        write: bool,
+        execute: bool,
+    ) -> Result<GuestAddress, Win32Error>;
+    /// Release a complete virtual-memory allocation.
+    fn free_virtual_memory(&mut self, address: GuestAddress) -> Result<(), Win32Error>;
+    /// Look up a loaded Host module by normalized DLL name.
+    fn loaded_module_handle(&self, name: &str) -> Option<GuestAddress>;
+    /// Resolve a named export and return an executable Host thunk address.
+    fn resolve_host_api(
+        &mut self,
+        module: GuestAddress,
+        name: &str,
+    ) -> Result<GuestAddress, Win32Error>;
+    /// Persistent ANSI command-line buffer owned by the guest process.
+    fn command_line_ansi(&self) -> GuestAddress;
+    /// Persistent UTF-16 command-line buffer owned by the guest process.
+    fn command_line_utf16(&self) -> GuestAddress;
+    /// Win32-visible path of the main executable.
+    fn main_module_path(&self) -> &str;
+    /// Current thread's simplified Win32 last-error value.
+    fn last_error(&self) -> u32;
+    /// Replace the current thread's simplified Win32 last-error value.
+    fn set_last_error(&mut self, value: u32);
+    /// Open a VFS path for sequential reading.
+    fn open_file_read(&mut self, path: &str) -> Result<Handle, Win32Error>;
+    /// Read bytes from an open file and advance its cursor.
+    fn read_file(&mut self, handle: Handle, length: usize) -> Result<Vec<u8>, Win32Error>;
+    /// Close an open file handle.
+    fn close_file(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Close a file or synchronization-object handle.
+    fn close_kernel_handle(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Create or reopen a named mutex, returning whether it already existed.
+    fn create_mutex(
+        &mut self,
+        name: Option<&str>,
+        initial_owner: bool,
+    ) -> Result<(Handle, bool), Win32Error>;
+    /// Release one recursive ownership level of a mutex.
+    fn release_mutex(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Create or reopen a named event object.
+    fn create_event(
+        &mut self,
+        name: Option<&str>,
+        manual_reset: bool,
+        initial_state: bool,
+    ) -> Result<(Handle, bool), Win32Error>;
+    /// Set or reset an event's signaled state.
+    fn set_event_state(&mut self, handle: Handle, signaled: bool) -> Result<(), Win32Error>;
+    /// Try to satisfy a wait immediately; `None` means valid but not signaled.
+    fn try_wait_for_objects(
+        &mut self,
+        handles: &[Handle],
+        wait_all: bool,
+    ) -> Result<Option<u32>, Win32Error>;
+    /// Begin one wildcard filesystem search.
+    fn find_first_file(&mut self, pattern: &str) -> Result<(Handle, FileEntry), Win32Error>;
+    /// Advance one wildcard filesystem search.
+    fn find_next_file(&mut self, handle: Handle) -> Result<Option<FileEntry>, Win32Error>;
+    /// Close one wildcard filesystem search.
+    fn close_file_search(&mut self, handle: Handle) -> Result<(), Win32Error>;
+    /// Query an open file's total byte length.
+    fn file_size(&self, handle: Handle) -> Result<u64, Win32Error>;
+    /// Return a pseudo handle for stdin, stdout, or stderr selectors.
+    fn standard_handle(&self, selector: i32) -> Option<Handle>;
+    /// Write bytes to a supported output handle.
+    fn write_handle(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, Win32Error>;
+    /// Move a disk-file cursor and return the absolute byte position.
+    fn seek_file(&mut self, handle: Handle, distance: i64, origin: u32) -> Result<u64, Win32Error>;
+    /// Return Win32 FILE_TYPE_* for a known handle.
+    fn file_type(&self, handle: Handle) -> Option<u32>;
+    /// Look up one case-insensitive process environment value.
+    fn environment_variable(&self, name: &str) -> Option<&str>;
+    /// Runtime-owned double-NUL ANSI environment block.
+    fn environment_block_ansi(&self) -> GuestAddress;
+    /// Runtime-owned double-NUL UTF-16 environment block.
+    fn environment_block_utf16(&self) -> GuestAddress;
+    /// Win32-visible current directory for relative path resolution.
+    fn current_directory(&self) -> &str;
+    /// Replace the Win32-visible current directory without changing the Host sandbox root.
+    fn set_current_directory(&mut self, path: &str) -> Result<(), Win32Error>;
+    /// Stable identifier of the single emulated process.
+    fn current_process_id(&self) -> u32;
+    /// Stable identifier of the initial emulated thread.
+    fn current_thread_id(&self) -> u32;
+}
+
+/// Encode a NUL-terminated Windows Japanese ANSI string.
+#[must_use]
+pub fn encode_ansi_z(value: &str) -> Vec<u8> {
+    let (encoded, _, _) = encoding_rs::SHIFT_JIS.encode(value);
+    let mut bytes = encoded.into_owned();
+    bytes.push(0);
+    bytes
+}
+
+/// Encode a NUL-terminated UTF-16LE string.
+#[must_use]
+pub fn encode_utf16_z(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+/// Read a Japanese Windows ANSI string from bounded guest memory.
+///
+/// `encoding_rs::SHIFT_JIS` follows the Windows-compatible mapping needed by
+/// the initial Japanese visual-novel target set.
+pub fn read_ansi_z(
+    context: &dyn HostCallContext,
+    address: GuestAddress,
+) -> Result<String, Win32Error> {
+    let mut bytes = Vec::new();
+    for offset in 0..MAX_GUEST_STRING_BYTES {
+        let offset = u32::try_from(offset)
+            .map_err(|_| Win32Error::InvalidArgument("ANSI string offset overflow"))?;
+        let current = address
+            .0
+            .checked_add(offset)
+            .ok_or(Win32Error::InvalidArgument("ANSI string address overflow"))?;
+        let mut byte = [0];
+        context.read_memory(GuestAddress(current), &mut byte)?;
+        if byte[0] == 0 {
+            let (decoded, had_errors) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(&bytes);
+            if had_errors {
+                return Err(Win32Error::InvalidArgument(
+                    "invalid Windows Shift-JIS string",
+                ));
+            }
+            return Ok(decoded.into_owned());
+        }
+        bytes.push(byte[0]);
+    }
+    Err(Win32Error::InvalidArgument(
+        "unterminated ANSI guest string",
+    ))
+}
+
+/// Read a bounded NUL-terminated UTF-16LE string from guest memory.
+pub fn read_utf16_z(
+    context: &dyn HostCallContext,
+    address: GuestAddress,
+) -> Result<String, Win32Error> {
+    let mut units = Vec::new();
+    for index in 0..MAX_GUEST_STRING_BYTES / 2 {
+        let byte_offset = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(Win32Error::InvalidArgument("UTF-16 string offset overflow"))?;
+        let current = address
+            .0
+            .checked_add(byte_offset)
+            .ok_or(Win32Error::InvalidArgument(
+                "UTF-16 string address overflow",
+            ))?;
+        let mut bytes = [0; 2];
+        context.read_memory(GuestAddress(current), &mut bytes)?;
+        let unit = u16::from_le_bytes(bytes);
+        if unit == 0 {
+            return String::from_utf16(&units)
+                .map_err(|_| Win32Error::InvalidArgument("invalid UTF-16 guest string"));
+        }
+        units.push(unit);
+    }
+    Err(Win32Error::InvalidArgument(
+        "unterminated UTF-16 guest string",
+    ))
+}
+
+/// Object-safe implementation of one imported API.
+pub trait HostCallHandler: Send + Sync {
+    /// Execute the host call against the current guest machine state.
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error>;
+}
+
+/// Registry mapping imported API names to host implementations.
+#[derive(Default)]
+pub struct ApiRegistry {
+    handlers: HashMap<ApiKey, Arc<dyn HostCallHandler>>,
+}
+
+impl ApiRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register or replace one API implementation.
+    pub fn register<H>(&mut self, key: ApiKey, handler: H)
+    where
+        H: HostCallHandler + 'static,
+    {
+        self.handlers.insert(key, Arc::new(handler));
+    }
+
+    /// Resolve a handler. Cloning the `Arc` lets the runtime invoke it while
+    /// mutably borrowing the machine context.
+    #[must_use]
+    pub fn resolve(&self, key: &ApiKey) -> Option<Arc<dyn HostCallHandler>> {
+        self.handlers.get(key).cloned().or_else(|| {
+            let undecorated = undecorate_stdcall(&key.name)?;
+            self.handlers
+                .get(&ApiKey::new(key.module.clone(), undecorated))
+                .cloned()
+        })
+    }
+
+    /// Number of registered names.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.handlers.len()
+    }
+
+    /// Whether no APIs are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+
+    /// Snapshot all normalized API keys registered in this process.
+    #[must_use]
+    pub fn registered_keys(&self) -> Vec<ApiKey> {
+        self.handlers.keys().cloned().collect()
+    }
+}
+
+fn undecorate_stdcall(name: &str) -> Option<&str> {
+    let without_prefix = name.strip_prefix('_')?;
+    let (base, argument_bytes) = without_prefix.rsplit_once('@')?;
+    if base.is_empty()
+        || argument_bytes.is_empty()
+        || !argument_bytes.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(base)
+}
+
+/// A registered placeholder that fails explicitly when called.
+#[derive(Debug, Clone)]
+pub struct UnsupportedApi {
+    feature: &'static str,
+}
+
+impl UnsupportedApi {
+    /// Describe the missing implementation.
+    #[must_use]
+    pub const fn new(feature: &'static str) -> Self {
+        Self { feature }
+    }
+}
+
+impl HostCallHandler for UnsupportedApi {
+    fn invoke(&self, _context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: self.feature,
+        })
+    }
+}
+
+/// Win32 state, registry, or host-call errors.
+#[derive(Debug, Error)]
+pub enum Win32Error {
+    /// An imported API does not have a registered implementation.
+    #[error("Win32 API is not registered: {module}!{name}")]
+    ApiNotRegistered {
+        /// Normalized DLL name.
+        module: String,
+        /// Imported export name.
+        name: String,
+    },
+    /// A known facility is beyond the current project milestone.
+    #[error("unsupported Win32 feature: {feature}")]
+    Unsupported {
+        /// Stable description of the missing facility.
+        feature: &'static str,
+    },
+    /// Handle allocation wrapped the 32-bit namespace.
+    #[error("Win32 handle table exhausted")]
+    HandleExhausted,
+    /// Guest memory could not satisfy an API access.
+    #[error("Win32 guest memory access failed: {0}")]
+    GuestMemory(String),
+    /// An API received an invalid guest value.
+    #[error("invalid Win32 argument: {0}")]
+    InvalidArgument(&'static str),
+    /// A guest allocation could not be satisfied.
+    #[error("Win32 guest allocation failed: out of memory")]
+    OutOfMemory,
+    /// A guest address is not owned by the requested allocator.
+    #[error("Win32 allocation address is invalid: {address:#010x}")]
+    InvalidAllocation {
+        /// Guest pointer supplied by the API caller.
+        address: u32,
+    },
+    /// A requested Host-provided DLL is not loaded.
+    #[error("Win32 module is not loaded: {0}")]
+    ModuleNotFound(String),
+    /// A requested Host API is not registered.
+    #[error("Win32 export is not available: {module}!{name}")]
+    ProcedureNotFound {
+        /// Normalized DLL name.
+        module: String,
+        /// Requested export name.
+        name: String,
+    },
+    /// An opaque handle was not present in the relevant table.
+    #[error("invalid Win32 handle: {0:#010x}")]
+    InvalidHandle(u32),
+    /// Host filesystem operation failed within the sandbox.
+    #[error("Win32 filesystem {operation} failed for {path}: {message}")]
+    Io {
+        /// Operation name.
+        operation: &'static str,
+        /// Guest-visible path.
+        path: String,
+        /// Host error text.
+        message: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_table_owns_values() {
+        let mut table = HandleTable::default();
+        let handle = table.insert("file").expect("handle should allocate");
+        assert_eq!(table.get(handle), Some(&"file"));
+        assert_eq!(table.remove(handle), Some("file"));
+    }
+
+    #[test]
+    fn api_keys_normalize_module_case() {
+        assert_eq!(
+            ApiKey::new("KERNEL32.DLL", "ExitProcess").module,
+            "kernel32.dll"
+        );
+    }
+
+    #[test]
+    fn registry_resolves_i686_stdcall_decoration() {
+        let mut registry = ApiRegistry::new();
+        registry.register(
+            ApiKey::new("kernel32.dll", "HeapAlloc"),
+            UnsupportedApi::new("test handler"),
+        );
+        assert!(
+            registry
+                .resolve(&ApiKey::new("KERNEL32.dll", "_HeapAlloc@12"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sandbox_maps_only_its_configured_guest_root() {
+        let filesystem = SandboxFileSystem::new("/tmp/vnrt-sandbox-test", r"C:\VNRT");
+        assert!(filesystem.resolve("../secret.txt").is_err());
+        assert_eq!(
+            filesystem.resolve(r"C:\VNRT\\assets\script.dat").unwrap(),
+            PathBuf::from("/tmp/vnrt-sandbox-test/assets/script.dat")
+        );
+        assert!(filesystem.resolve("D:\\secret.txt").is_err());
+        assert!(filesystem.resolve("C:\\Windows\\secret.txt").is_err());
+        assert!(filesystem.resolve("/etc/passwd").is_err());
+        assert!(filesystem.resolve("assets\\script.dat").is_ok());
+    }
+
+    #[test]
+    fn wildcard_matching_is_case_insensitive() {
+        assert!(wildcard_matches("*.ypf", "CG.YPF"));
+        assert!(wildcard_matches("update?.ypf", "update3.ypf"));
+        assert!(!wildcard_matches("*.ypf", "cg.ypf_old"));
+    }
+}

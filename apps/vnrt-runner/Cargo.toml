@@ -1,0 +1,28 @@
+[package]
+name = "vnrt-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+sdl3-backend = ["vnrt-runtime/sdl3-backend"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vnrt-debugger = { path = "../../crates/vnrt-debugger" }
+vnrt-gdi32 = { path = "../../crates/vnrt-gdi32" }
+vnrt-kernel32 = { path = "../../crates/vnrt-kernel32" }
+vnrt-ole32 = { path = "../../crates/vnrt-ole32" }
+vnrt-runtime = { path = "../../crates/vnrt-runtime" }
+vnrt-shell32 = { path = "../../crates/vnrt-shell32" }
+vnrt-user32 = { path = "../../crates/vnrt-user32" }
+vnrt-winmm = { path = "../../crates/vnrt-winmm" }
+vnrt-win32 = { path = "../../crates/vnrt-win32" }
+
+[lints]
+workspace = true

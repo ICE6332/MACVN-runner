@@ -1,0 +1,17 @@
+[package]
+name = "vnrt-debugger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+vnrt-memory = { path = "../vnrt-memory" }
+vnrt-win32 = { path = "../vnrt-win32" }
+vnrt-x86 = { path = "../vnrt-x86" }
+
+[lints]
+workspace = true
+

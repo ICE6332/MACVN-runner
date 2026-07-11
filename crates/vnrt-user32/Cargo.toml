@@ -1,0 +1,14 @@
+[package]
+name = "vnrt-user32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+tracing.workspace = true
+vnrt-win32 = { path = "../vnrt-win32" }
+
+[lints]
+workspace = true
