@@ -22,7 +22,7 @@ mod tests;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -250,6 +250,7 @@ pub struct Runtime {
     import_thunks: HashMap<GuestAddress, ApiKey>,
     exit_code: Option<u32>,
     started_at: Instant,
+    virtual_time: Duration,
     image_base: GuestAddress,
     resource_directory: Option<(GuestAddress, u32)>,
     heaps: GuestHeapManager,
@@ -328,8 +329,19 @@ struct GuestCallback {
     arguments: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SuspendedCallKind {
+    #[default]
+    Generic,
+    /// Modal dialog Host loop waiting for EndDialog.
+    ModalDialog {
+        handle: u32,
+    },
+}
+
 #[derive(Debug)]
 struct SuspendedHostCall {
+    kind: SuspendedCallKind,
     return_address: u32,
     resumed_stack_pointer: u32,
     callback_stack_pointer: u32,
@@ -421,6 +433,7 @@ impl Runtime {
             import_thunks,
             exit_code: None,
             started_at: Instant::now(),
+            virtual_time: Duration::ZERO,
             image_base: GuestAddress(image.optional.image_base),
             resource_directory,
             heaps: GuestHeapManager::new(),
@@ -905,6 +918,7 @@ impl Runtime {
             exit_code: &mut self.exit_code,
             stdcall_cleanup: 0,
             started_at: self.started_at,
+            virtual_time: &mut self.virtual_time,
             heaps: &mut self.heaps,
             global_allocations: &mut self.global_allocations,
             tls_slots: &mut self.tls_slots,
@@ -975,6 +989,8 @@ impl Runtime {
             suspended_host_calls: &mut self.suspended_host_calls,
             guest_callback_targets: &mut self.guest_callback_targets,
             capture_callback_return: false,
+            next_suspend_kind: SuspendedCallKind::Generic,
+            modal_dialog_completed: false,
             raised_exception: None,
         };
         let invocation = handler.invoke(&mut context);
@@ -984,9 +1000,15 @@ impl Runtime {
             *context.last_error,
         )?;
         let scheduler_switched = context.scheduler_switched;
+        let modal_dialog_completed = context.modal_dialog_completed;
         invocation?;
         if scheduler_switched {
             // The cooperative scheduler already installed another Guest context.
+            return Ok(());
+        }
+        if modal_dialog_completed {
+            // EndDialog already restored the DialogBox* caller and abandoned
+            // nested DispatchMessage frames; do not return into DialogProc.
             return Ok(());
         }
         if context.exit_code.is_none() {
@@ -1013,8 +1035,10 @@ impl Runtime {
                 let return_value = context.cpu.state.registers.eax;
                 let callbacks = std::mem::take(&mut context.guest_callbacks);
                 let capture_callback_return = context.capture_callback_return;
+                let kind = context.next_suspend_kind;
                 drop(context);
                 self.suspended_host_calls.push(SuspendedHostCall {
+                    kind,
                     return_address,
                     resumed_stack_pointer,
                     callback_stack_pointer: stack,

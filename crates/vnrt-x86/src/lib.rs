@@ -4,8 +4,9 @@
 //! of Win32 modules, handles, or APIs.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    rc::Rc,
 };
 
 use iced_x86::{
@@ -428,12 +429,13 @@ pub struct Interpreter {
     /// Architectural state exposed to the runtime and debugger.
     pub state: CpuState,
     instruction_cache: HashMap<u32, CachedInstruction>,
-    block_cache: HashMap<u32, Arc<CachedBlock>>,
+    block_cache: HashMap<u32, Rc<CachedBlock>>,
     block_hotness: HashMap<u32, u8>,
     recent_control_transfers: VecDeque<ControlTransfer>,
     targeted_control_transfers: VecDeque<ControlTransfer>,
     trace_range: Option<(u32, u32)>,
     traced_instructions: VecDeque<TracedInstruction>,
+    block_profile: Option<HashMap<u32, u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +449,7 @@ struct CachedInstruction {
 struct CachedBlock {
     instructions: Vec<Instruction>,
     page_generations: Vec<(GuestAddress, u64)>,
+    validated_executable_epoch: Cell<u64>,
 }
 
 impl Interpreter {
@@ -466,6 +469,7 @@ impl Interpreter {
             ),
             trace_range: None,
             traced_instructions: VecDeque::with_capacity(INSTRUCTION_TRACE_LIMIT),
+            block_profile: None,
         }
     }
 
@@ -492,6 +496,28 @@ impl Interpreter {
     #[must_use]
     pub fn targeted_control_transfers(&self) -> &VecDeque<ControlTransfer> {
         &self.targeted_control_transfers
+    }
+
+    /// Enable or disable opt-in Guest basic-block entry profiling.
+    pub fn set_block_profiling(&mut self, enabled: bool) {
+        self.block_profile = enabled.then(HashMap::new);
+    }
+
+    /// Return the most frequently entered Guest basic blocks.
+    #[must_use]
+    pub fn hottest_blocks(&self, limit: usize) -> Vec<(GuestAddress, u64)> {
+        let mut blocks = self
+            .block_profile
+            .as_ref()
+            .into_iter()
+            .flat_map(|profile| profile.iter())
+            .map(|(address, hits)| (GuestAddress(*address), *hits))
+            .collect::<Vec<_>>();
+        blocks.sort_unstable_by(|left, right| {
+            right.1.cmp(&left.1).then_with(|| left.0.0.cmp(&right.0.0))
+        });
+        blocks.truncate(limit);
+        blocks
     }
 
     /// Execute one instruction or report an external call boundary.
@@ -563,6 +589,10 @@ impl Interpreter {
                 return Ok(BatchOutcome::Halted { steps: steps + 1 });
             }
             let eip = GuestAddress(self.state.registers.eip);
+            if let Some(profile) = &mut self.block_profile {
+                let hits = profile.entry(eip.0).or_default();
+                *hits = hits.saturating_add(1);
+            }
             if resolver.is_external_target(eip) {
                 return Ok(BatchOutcome::ExternalCall {
                     address: eip,
@@ -661,7 +691,7 @@ impl Interpreter {
         &mut self,
         memory: &GuestMemory,
         start: GuestAddress,
-    ) -> Result<Option<Arc<CachedBlock>>, CpuError> {
+    ) -> Result<Option<Rc<CachedBlock>>, CpuError> {
         if let Some(block) = self.block_cache.get(&start.0).cloned()
             && block_is_valid(memory, &block)?
         {
@@ -691,15 +721,19 @@ impl Interpreter {
                 break;
             }
         }
-        let block = Arc::new(CachedBlock {
+        // One Interpreter is driven by one Host thread. Rc avoids atomic
+        // reference-count traffic on every hot basic-block entry while still
+        // allowing the block to outlive the mutable cache borrow during execute.
+        let block = Rc::new(CachedBlock {
             instructions,
             page_generations,
+            validated_executable_epoch: Cell::new(memory.executable_epoch()),
         });
         if self.block_cache.len() >= MAX_BLOCK_CACHE_ENTRIES {
             self.block_cache.clear();
             self.block_hotness.clear();
         }
-        self.block_cache.insert(start.0, Arc::clone(&block));
+        self.block_cache.insert(start.0, Rc::clone(&block));
         Ok(Some(block))
     }
 
@@ -841,6 +875,49 @@ impl Interpreter {
             }
             Mnemonic::Fsqrt => {
                 self.x87_set(0, self.x87_get(0).sqrt());
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fsin | Mnemonic::Fcos => {
+                let value = self.x87_get(0);
+                if self.x87_trig_argument_is_reducible(value) {
+                    let result = if instruction.mnemonic() == Mnemonic::Fsin {
+                        value.sin()
+                    } else {
+                        value.cos()
+                    };
+                    self.x87_set(0, result);
+                    self.set_x87_argument_reduction_complete(true);
+                } else {
+                    self.set_x87_argument_reduction_complete(false);
+                }
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fsincos => {
+                let value = self.x87_get(0);
+                if self.x87_trig_argument_is_reducible(value) {
+                    self.x87_set(0, value.sin());
+                    self.x87_push(value.cos());
+                    self.set_x87_argument_reduction_complete(true);
+                } else {
+                    self.set_x87_argument_reduction_complete(false);
+                }
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fptan => {
+                let value = self.x87_get(0);
+                if self.x87_trig_argument_is_reducible(value) {
+                    self.x87_set(0, value.tan());
+                    self.x87_push(1.0);
+                    self.set_x87_argument_reduction_complete(true);
+                } else {
+                    self.set_x87_argument_reduction_complete(false);
+                }
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fpatan => {
+                let result = self.x87_get(1).atan2(self.x87_get(0));
+                self.x87_set(1, result);
+                self.x87_pop();
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Frndint => {
@@ -1330,6 +1407,23 @@ impl Interpreter {
             2 => value.ceil(),
             3 => value.trunc(),
             _ => unreachable!(),
+        }
+    }
+
+    fn x87_trig_argument_is_reducible(&self, value: f64) -> bool {
+        // Native x87 reports incomplete argument reduction through C2 for
+        // finite magnitudes at or above 2^63 and leaves the stack unchanged.
+        !value.is_finite() || value.abs() < 9_223_372_036_854_775_808.0
+    }
+
+    fn set_x87_argument_reduction_complete(&mut self, complete: bool) {
+        const C1: u16 = 1 << 9;
+        const C2: u16 = 1 << 10;
+        self.state.x87_status_word &= !C1;
+        if complete {
+            self.state.x87_status_word &= !C2;
+        } else {
+            self.state.x87_status_word |= C2;
         }
     }
 
@@ -2851,11 +2945,16 @@ fn second_page_generation(
 }
 
 fn block_is_valid(memory: &GuestMemory, block: &CachedBlock) -> Result<bool, CpuError> {
+    let executable_epoch = memory.executable_epoch();
+    if block.validated_executable_epoch.get() == executable_epoch {
+        return Ok(true);
+    }
     for (page, generation) in &block.page_generations {
         if memory.executable_page_generation(*page)? != *generation {
             return Ok(false);
         }
     }
+    block.validated_executable_epoch.set(executable_epoch);
     Ok(true)
 }
 
@@ -3462,6 +3561,45 @@ mod tests {
         assert_eq!(cpu.x87_get(0), 3.0);
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         assert_eq!(cpu.x87_get(0), 7.0);
+    }
+
+    #[test]
+    fn x87_trigonometric_functions_update_stack_and_reduction_status() {
+        // fsin; fcos; fsincos
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xfe, 0xd9, 0xff, 0xd9, 0xfb]);
+        cpu.state.x87_status_word |= 1 << 10;
+        cpu.x87_push(std::f64::consts::FRAC_PI_2);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!((cpu.x87_get(0) - 1.0).abs() < f64::EPSILON);
+        assert_eq!(cpu.state.x87_status_word & (1 << 10), 0);
+
+        cpu.x87_set(0, 0.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!((cpu.x87_get(0) - 1.0).abs() < f64::EPSILON);
+
+        cpu.x87_set(0, 0.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!((cpu.x87_get(0) - 1.0).abs() < f64::EPSILON); // cosine
+        assert!(cpu.x87_get(1).abs() < f64::EPSILON); // sine
+    }
+
+    #[test]
+    fn x87_tangent_pair_and_large_argument_status_execute() {
+        // fptan; fpatan; fsin
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xf2, 0xd9, 0xf3, 0xd9, 0xfe]);
+        cpu.x87_push(std::f64::consts::FRAC_PI_4);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!((cpu.x87_get(0) - 1.0).abs() < f64::EPSILON);
+        assert!((cpu.x87_get(1) - 1.0).abs() < 1e-15);
+
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!((cpu.x87_get(0) - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+
+        let too_large = 9_223_372_036_854_775_808.0;
+        cpu.x87_set(0, too_large);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), too_large);
+        assert_ne!(cpu.state.x87_status_word & (1 << 10), 0);
     }
 
     #[test]
@@ -4079,6 +4217,19 @@ mod tests {
         ];
         assert_eq!(cpu.recent_control_transfers(), expected);
         assert_eq!(cpu.targeted_control_transfers(), &expected);
+    }
+
+    #[test]
+    fn opt_in_block_profile_ranks_hot_guest_entries() {
+        // inc eax; jmp 1000h
+        let (mut cpu, mut memory) = machine(&[0x40, 0xeb, 0xfd]);
+        cpu.set_block_profiling(true);
+
+        assert_eq!(
+            cpu.run_batch(&mut memory, &NoExternalTargets, 12).unwrap(),
+            BatchOutcome::BudgetExhausted { steps: 12 }
+        );
+        assert_eq!(cpu.hottest_blocks(1), vec![(GuestAddress(0x1000), 6)]);
     }
 
     #[test]

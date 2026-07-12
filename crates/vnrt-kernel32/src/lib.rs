@@ -507,7 +507,7 @@ struct Sleep;
 impl HostCallHandler for Sleep {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let milliseconds = context.argument_u32(0)?;
-        std::thread::sleep(std::time::Duration::from_millis(u64::from(milliseconds)));
+        context.advance_monotonic_time(milliseconds);
         context.set_stdcall_cleanup(4);
         Ok(())
     }

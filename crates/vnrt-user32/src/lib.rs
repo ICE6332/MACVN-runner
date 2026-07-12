@@ -1955,9 +1955,13 @@ impl HostCallHandler for DialogBoxParamA {
                 "resolved Guest dialog template"
             );
         }
-        if instance == 0 || template == 0 || parent != 0 || dialog_proc == 0 {
+        if instance == 0
+            || template == 0
+            || dialog_proc == 0
+            || (parent != 0 && !context.is_window(parent))
+        {
             return Err(Win32Error::InvalidArgument(
-                "DialogBoxParamA bootstrap arguments",
+                "DialogBoxParamA required arguments or parent window",
             ));
         }
         let accept_id = dialog
@@ -1968,12 +1972,18 @@ impl HostCallHandler for DialogBoxParamA {
         context.set_stdcall_cleanup(20);
         let callback = GuestAddress(dialog_proc);
         context.register_guest_callback_target(STARTUP_DIALOG_HANDLE, callback);
+        // Tag this Host frame so EndDialog can resume DialogBoxParamA even when
+        // nested DispatchMessage frames sit above it on the suspend stack.
+        context.mark_modal_dialog_host_call(STARTUP_DIALOG_HANDLE);
         context.request_guest_callback(
             callback,
             &[STARTUP_DIALOG_HANDLE, WM_INITDIALOG, 0, parameter],
         )?;
-        context
-            .request_guest_callback(callback, &[STARTUP_DIALOG_HANDLE, WM_COMMAND, accept_id, 0])?;
+        // A modal dialog's command is a queued message, not a second callback
+        // that can only run after WM_INITDIALOG returns. Some engines pump
+        // PeekMessage inside their initialization handler; putting the command
+        // on that queue lets the Guest dispatch and close the dialog naturally.
+        context.post_thread_message(STARTUP_DIALOG_HANDLE, WM_COMMAND, accept_id, 0);
         Ok(())
     }
 }
@@ -2793,7 +2803,9 @@ impl HostCallHandler for EndDialog {
         context.set_return_u32(u32::from(dialog == STARTUP_DIALOG_HANDLE));
         context.set_stdcall_cleanup(8);
         if dialog == STARTUP_DIALOG_HANDLE {
-            context.complete_suspended_host_call(result)?;
+            // Complete DialogBoxParamA, not a nested DispatchMessage that may
+            // be the current top of the suspended Host-call stack.
+            context.complete_modal_dialog(dialog, result)?;
         }
         Ok(())
     }

@@ -67,6 +67,9 @@ fn main() -> Result<ExitCode> {
             .cpu
             .set_trace_range(Some(parse_address_range(&range.to_string_lossy())?));
     }
+    runtime
+        .cpu
+        .set_block_profiling(std::env::var_os("VNRT_PROFILE_BLOCKS").is_some());
     let graphics = vnrt_gfx_wgpu::WgpuGraphicsDevice::new().context("failed to initialize GPU")?;
     info!(adapter = graphics.adapter_name(), "Host GPU initialized");
     runtime.set_graphics_device(Box::new(graphics));
@@ -101,6 +104,7 @@ fn main() -> Result<ExitCode> {
                 executable_write_source_previews = ?executable_write_source_previews(&runtime),
                 traced_instructions = ?runtime.cpu.traced_instructions(),
                 targeted_control_transfers = ?runtime.cpu.targeted_control_transfers(),
+                hottest_blocks = ?runtime.cpu.hottest_blocks(32),
                 "guest execution failed"
             );
             emit_guest_output(&runtime)?;
@@ -132,6 +136,9 @@ fn main() -> Result<ExitCode> {
             traced_instructions = ?runtime.cpu.traced_instructions(),
             "Guest instruction trace completed"
         );
+    }
+    if std::env::var_os("VNRT_PROFILE_BLOCKS").is_some() {
+        info!(hottest_blocks = ?runtime.cpu.hottest_blocks(32), "Guest block profile completed");
     }
     if let Some(range) = std::env::var_os("VNRT_DUMP_MEMORY") {
         let (start, end) = parse_address_range(&range.to_string_lossy())?;

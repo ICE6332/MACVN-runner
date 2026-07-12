@@ -123,17 +123,15 @@ COMCTL32 #17 and DSOUND #1 imports correctly. The child crosses
 `CreateWindowExA` and reaches real resource keys such as `W0/CGS100`; the
 current executed frontier is PNG `gAMA` processing in image initialization.
 
-Resource workers, cooperative waits, ShowWindow, and the initial DC probe now
-run. The null execute after `GetDC` / `SetStretchBltMode` / `logprint` /
-`ReleaseDC` was traced to `logprint!Test`: the Guest passes thirteen DWORDs and
-expects callee cleanup, while the placeholder leaked 52 bytes. Correct stdcall
-cleanup now returns to the real caller and survives the former fault. A deep
-run continued for more than eight minutes beyond that point without presenting
-a frame, so the next step is bounded profiling of the post-probe path, followed
-by the first observed `Direct3DCreate9`/presentation calls. Build only the COM
-methods the target calls over `vnrt-gfx`; the wgpu backend and `vnrt-media`
-decoders are already available. Finally attach the modeled User32 window and
-presented frame to a native SDL3 window.
+Resource workers, cooperative waits, ShowWindow, and the startup dialog path
+now run. `logprint!Test` cleans its thirteen stdcall arguments. Modal
+`DialogBoxParamA` posts `WM_COMMAND` onto the Guest queue for natural
+`PeekMessage`/`DispatchMessage` pumping, and `EndDialog` completes the marked
+modal DialogBox Host frame—not a nested `DispatchMessage` suspend—so the
+dialog can return into the main startup path. Continue until
+`Direct3DCreate9` executes; build only the COM methods the target calls over
+`vnrt-gfx`. Finally attach the modeled User32 window and presented frame to a
+native SDL3 window.
 
 ## Following target milestone: complete target and first real window
 
@@ -143,8 +141,8 @@ blocking `WaitFor*` parks the current Guest context and schedules a Ready
 worker, and `SetEvent`/`ExitThread` wake waiters without Host-native threads.
 MMX coverage was extended for the post-wait pixel path.
 
-1. Profile the long post-probe path and stop at the next bounded CPU/API/frame
-   frontier instead of spending another unobserved 10B-step run.
+1. Run the target past the startup dialog and stop at the next bounded
+   CPU/API/frame frontier (expected: `Direct3DCreate9` or a small new gap).
 2. Implement the target-observed Direct3D 9 creation and presentation path.
 3. Extend cooperative scheduling only as the target demands it (finite wait
    timeouts, file-mapping waitables, broader TLS template copy).

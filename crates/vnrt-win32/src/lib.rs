@@ -935,6 +935,14 @@ pub trait HostCallContext {
     fn use_guest_callback_return_value(&mut self);
     /// Finish the suspended Host call after the active Guest callback returns.
     fn complete_suspended_host_call(&mut self, return_value: u32) -> Result<(), Win32Error>;
+    /// Mark the Host call currently being suspended as a modal dialog loop.
+    ///
+    /// Nested `DispatchMessage` callbacks must not steal `EndDialog`; the
+    /// dialog frame is identified by this mark when the dialog is dismissed.
+    fn mark_modal_dialog_host_call(&mut self, dialog: u32);
+    /// Complete the modal `DialogBox*` Host frame for `dialog`, abandoning any
+    /// nested suspended Host calls above it and resuming the dialog's caller.
+    fn complete_modal_dialog(&mut self, dialog: u32, result: u32) -> Result<(), Win32Error>;
     /// Associate a Guest callback with an opaque Win32 object handle.
     fn register_guest_callback_target(&mut self, object: u32, callback: GuestAddress);
     /// Look up the Guest callback associated with an opaque Win32 object handle.
@@ -1114,6 +1122,8 @@ pub trait HostCallContext {
     ) -> Result<(), Win32Error>;
     /// Milliseconds elapsed on the runtime's monotonic process clock.
     fn tick_count(&self) -> u32;
+    /// Advance Guest-observed time without blocking the Host interpreter.
+    fn advance_monotonic_time(&mut self, milliseconds: u32);
     /// Nanosecond-frequency monotonic performance-counter value.
     fn performance_counter(&self) -> u64;
     /// Number of performance-counter ticks per second.

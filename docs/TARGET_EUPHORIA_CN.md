@@ -161,14 +161,16 @@ Observed post-scheduler startup path (release, ~5B steps / ~3 minutes wall):
 5. `GetDC` → `SetStretchBltMode` → optional `logprint!Test` → `ReleaseDC`.
 
 The former execute access violation at address 0 after this sequence was an ABI
-error, not a missing GDI call. Runtime instruction and control-transfer tracing
-showed that `logprint!Test` receives thirteen DWORD arguments and must clean 52
-bytes. The zero-cleanup placeholder left ESP at `0x7feffe74`; correct cleanup
-returns through the saved `0x40f879` address at `0x7feffea8`. With that fixed,
-the target survives the old fault and continues through a longer CPU-heavy path
-for more than eight minutes without presenting a frame. No
-`Direct3DCreate9` host call has been confirmed yet; the next run should use a
-bounded instruction/API profile to identify the new frontier efficiently.
+error, not a missing GDI call. `logprint!Test` receives thirteen DWORD arguments
+and must clean 52 bytes.
+
+Startup then reaches a modal `DialogBoxParamA`. `WM_INITDIALOG` may pump
+`PeekMessage`/`DispatchMessage`; the synthetic accept `WM_COMMAND` is therefore
+queued rather than force-injected as a second Host callback. `EndDialog` must
+complete the **modal DialogBox Host frame** (marked at open), not the nested
+`DispatchMessage` frame that may be the top of the suspend stack—otherwise the
+outer dialog never returns and the Guest stays in Peek/Sleep. With that fix,
+the next expected milestones are remaining init, then `Direct3DCreate9`.
 
 `DecodePointer(NULL)` now returns NULL (Encode still cookie-xors null to a
 non-null token), matching native CRT expectations for empty handler slots.

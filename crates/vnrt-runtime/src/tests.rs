@@ -92,6 +92,28 @@ fn headless_audio_is_explicitly_unsupported() {
 }
 
 #[test]
+fn guest_sleep_advances_virtual_time_without_host_delay() {
+    let image = image_that_calls_exit_process(0);
+    let mut runtime = Runtime::load(&image, ApiRegistry::new()).expect("guest should load");
+    let host_start = Instant::now();
+    let before = {
+        let context = test_host_context(&mut runtime);
+        context.tick_count()
+    };
+    {
+        let mut context = test_host_context(&mut runtime);
+        context.advance_monotonic_time(2_000);
+    }
+    let after = {
+        let context = test_host_context(&mut runtime);
+        context.tick_count()
+    };
+
+    assert!(after.wrapping_sub(before) >= 2_000);
+    assert!(host_start.elapsed() < Duration::from_millis(100));
+}
+
+#[test]
 fn private_heaps_preserve_reallocated_bytes_and_ownership() {
     let mut memory = GuestMemory::new();
     let mut heaps = GuestHeapManager::new();
@@ -279,6 +301,81 @@ fn returning_from_process_entry_exits_with_eax() {
         runtime.threads.current().state,
         GuestThreadState::Terminated
     );
+}
+
+#[test]
+fn end_dialog_completes_modal_dialog_not_nested_dispatch() {
+    // Outer modal DialogBox-like Host call, then nested DispatchMessage-like
+    // Host call. EndDialog must resume the modal caller, not the nested frame.
+    let image = image_with_one_import();
+    let mut registry = ApiRegistry::new();
+    registry.register(
+        ApiKey::new("user32.dll", "MessageBoxA"),
+        NestedDialogHostCall,
+    );
+    let mut runtime = Runtime::load(&image, registry).expect("guest should load");
+    runtime
+        .memory
+        .map_range(GuestAddress(0x3000), 0x2000, Permissions::ALL)
+        .unwrap();
+    // DialogProc: EndDialog(dialog, 0x55); ret 16
+    // push 0x55; push dialog; call EndDialog; ret 10h — implemented via Host
+    // through a second import would be heavy; drive complete_modal_dialog
+    // through RuntimeHostContext after building the suspend stack manually.
+    runtime.memory.write(GuestAddress(0x4000), &[0xf4]).unwrap();
+
+    let dialog = 0x0002_0000_u32;
+    let dialog_return = 0x4000_u32;
+    let dialog_resume_esp = GUEST_STACK_TOP - 8;
+    let nested_return = 0x4010_u32;
+    runtime
+        .suspended_host_calls
+        .push(SuspendedHostCall {
+            kind: SuspendedCallKind::ModalDialog { handle: dialog },
+            return_address: dialog_return,
+            resumed_stack_pointer: dialog_resume_esp,
+            callback_stack_pointer: dialog_resume_esp - 0x20,
+            return_value: 1,
+            capture_callback_return: false,
+            callbacks: VecDeque::new(),
+        });
+    runtime.suspended_host_calls.push(SuspendedHostCall {
+        kind: SuspendedCallKind::Generic,
+        return_address: nested_return,
+        resumed_stack_pointer: dialog_resume_esp - 0x40,
+        callback_stack_pointer: dialog_resume_esp - 0x60,
+        return_value: 0,
+        capture_callback_return: true,
+        callbacks: VecDeque::new(),
+    });
+    runtime
+        .guest_callback_targets
+        .insert(dialog, GuestAddress(0x3000));
+
+    {
+        let mut context = test_host_context(&mut runtime);
+        context
+            .complete_modal_dialog(dialog, 0x55)
+            .expect("EndDialog should locate the modal frame");
+        assert!(context.modal_dialog_completed);
+    }
+
+    assert!(runtime.suspended_host_calls.is_empty());
+    assert!(!runtime.guest_callback_targets.contains_key(&dialog));
+    assert_eq!(runtime.cpu.state.registers.eax, 0x55);
+    assert_eq!(runtime.cpu.state.registers.eip, dialog_return);
+    assert_eq!(runtime.cpu.state.registers.esp, dialog_resume_esp);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NestedDialogHostCall;
+
+impl vnrt_win32::HostCallHandler for NestedDialogHostCall {
+    fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
+        context.set_return_u32(0);
+        context.set_stdcall_cleanup(4);
+        Ok(())
+    }
 }
 
 #[test]
@@ -824,6 +921,7 @@ fn test_host_context(runtime: &mut Runtime) -> RuntimeHostContext<'_> {
         exit_code: &mut runtime.exit_code,
         stdcall_cleanup: 0,
         started_at: runtime.started_at,
+        virtual_time: &mut runtime.virtual_time,
         heaps: &mut runtime.heaps,
         global_allocations: &mut runtime.global_allocations,
         tls_slots: &mut runtime.tls_slots,
@@ -894,6 +992,8 @@ fn test_host_context(runtime: &mut Runtime) -> RuntimeHostContext<'_> {
         suspended_host_calls: &mut runtime.suspended_host_calls,
         guest_callback_targets: &mut runtime.guest_callback_targets,
         capture_callback_return: false,
+        next_suspend_kind: SuspendedCallKind::Generic,
+        modal_dialog_completed: false,
         raised_exception: None,
     }
 }

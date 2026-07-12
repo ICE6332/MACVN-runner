@@ -6,6 +6,7 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) exit_code: &'a mut Option<u32>,
     pub(super) stdcall_cleanup: u32,
     pub(super) started_at: Instant,
+    pub(super) virtual_time: &'a mut Duration,
     pub(super) heaps: &'a mut GuestHeapManager,
     pub(super) global_allocations: &'a mut BTreeMap<u32, u32>,
     pub(super) tls_slots: &'a mut TlsSlotManager,
@@ -77,6 +78,10 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) suspended_host_calls: &'a mut Vec<SuspendedHostCall>,
     pub(super) guest_callback_targets: &'a mut HashMap<u32, GuestAddress>,
     pub(super) capture_callback_return: bool,
+    /// Kind applied to the Host call being suspended for Guest callbacks.
+    pub(super) next_suspend_kind: SuspendedCallKind,
+    /// When set, EndDialog has already restored the modal dialog caller.
+    pub(super) modal_dialog_completed: bool,
     pub(super) raised_exception: Option<(u32, u32, Vec<u32>)>,
 }
 
@@ -216,6 +221,45 @@ impl HostCallContext for RuntimeHostContext<'_> {
                 ))?;
         continuation.return_value = return_value;
         continuation.callbacks.clear();
+        Ok(())
+    }
+
+    fn mark_modal_dialog_host_call(&mut self, dialog: u32) {
+        self.next_suspend_kind = SuspendedCallKind::ModalDialog { handle: dialog };
+    }
+
+    fn complete_modal_dialog(&mut self, dialog: u32, result: u32) -> Result<(), Win32Error> {
+        let index = self
+            .suspended_host_calls
+            .iter()
+            .rposition(|call| {
+                matches!(
+                    call.kind,
+                    SuspendedCallKind::ModalDialog { handle } if handle == dialog
+                )
+            })
+            .ok_or(Win32Error::InvalidArgument(
+                "no suspended modal dialog for EndDialog",
+            ))?;
+        // Nested DispatchMessage / other Host frames above the dialog are
+        // abandoned with the modal loop; only the DialogBox* caller resumes.
+        self.suspended_host_calls.truncate(index + 1);
+        let continuation = self
+            .suspended_host_calls
+            .pop()
+            .expect("modal dialog frame was located above");
+        self.guest_callback_targets.remove(&dialog);
+        self.cpu.state.registers.eax = result;
+        self.cpu.state.registers.esp = continuation.resumed_stack_pointer;
+        self.cpu.state.registers.eip = continuation.return_address;
+        self.modal_dialog_completed = true;
+        self.guest_callbacks.clear();
+        debug!(
+            dialog,
+            result,
+            return_address = continuation.return_address,
+            "completed modal Guest dialog Host call"
+        );
         Ok(())
     }
 
@@ -779,11 +823,26 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn tick_count(&self) -> u32 {
-        self.started_at.elapsed().as_millis() as u32
+        self.started_at
+            .elapsed()
+            .saturating_add(*self.virtual_time)
+            .as_millis() as u32
+    }
+
+    fn advance_monotonic_time(&mut self, milliseconds: u32) {
+        *self.virtual_time = self
+            .virtual_time
+            .saturating_add(Duration::from_millis(u64::from(milliseconds)));
     }
 
     fn performance_counter(&self) -> u64 {
-        u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        u64::try_from(
+            self.started_at
+                .elapsed()
+                .saturating_add(*self.virtual_time)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn performance_frequency(&self) -> u64 {
@@ -793,6 +852,8 @@ impl HostCallContext for RuntimeHostContext<'_> {
     fn system_time_filetime(&self) -> u64 {
         const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
         let unix = SystemTime::now()
+            .checked_add(*self.virtual_time)
+            .unwrap_or(SystemTime::now())
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         WINDOWS_TO_UNIX_SECONDS
