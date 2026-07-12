@@ -781,7 +781,11 @@ impl Interpreter {
             | Mnemonic::Fsubr
             | Mnemonic::Fsubrp
             | Mnemonic::Fmul
-            | Mnemonic::Fmulp => {
+            | Mnemonic::Fmulp
+            | Mnemonic::Fdiv
+            | Mnemonic::Fdivp
+            | Mnemonic::Fdivr
+            | Mnemonic::Fdivrp => {
                 self.execute_x87_binary(memory, instruction)?;
                 self.state.registers.eip = next_ip;
             }
@@ -808,14 +812,14 @@ impl Interpreter {
                 self.x87_push(value);
                 self.state.registers.eip = next_ip;
             }
-            Mnemonic::Fstp => {
+            Mnemonic::Fst | Mnemonic::Fstp => {
                 let value = self.x87_get(0);
                 if instruction.op_kind(0) == OpKind::Register {
                     let destination =
                         x87_register_index(instruction.op_register(0)).ok_or_else(|| {
                             CpuError::UnsupportedOperand {
                                 address: instruction.ip32(),
-                                detail: "FSTP destination is not ST(i)".to_owned(),
+                                detail: "FST destination is not ST(i)".to_owned(),
                             }
                         })?;
                     self.x87_set(destination, value);
@@ -831,12 +835,14 @@ impl Interpreter {
                         _ => {
                             return Err(CpuError::UnsupportedOperand {
                                 address: instruction.ip32(),
-                                detail: "unsupported FSTP memory width".to_owned(),
+                                detail: "unsupported FST memory width".to_owned(),
                             });
                         }
                     }
                 }
-                self.x87_pop();
+                if instruction.mnemonic() == Mnemonic::Fstp {
+                    self.x87_pop();
+                }
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Fistp => {
@@ -1163,15 +1169,22 @@ impl Interpreter {
             } else {
                 0
             };
-        let source = if instruction.op_count() >= 2 {
-            match instruction.op_kind(1) {
+        let source_operand = if instruction.op_count() >= 2 {
+            Some(1)
+        } else if instruction.op_count() == 1 && instruction.op_kind(0) == OpKind::Memory {
+            // x87 memory arithmetic encodes ST(0) implicitly, so iced-x86
+            // exposes only the memory source operand.
+            Some(0)
+        } else {
+            None
+        };
+        let source = if let Some(source_operand) = source_operand {
+            match instruction.op_kind(source_operand) {
                 OpKind::Register => {
-                    let index =
-                        x87_register_index(instruction.op_register(1)).ok_or_else(|| {
-                            CpuError::UnsupportedOperand {
-                                address: instruction.ip32(),
-                                detail: "x87 source is not ST(i)".to_owned(),
-                            }
+                    let index = x87_register_index(instruction.op_register(source_operand))
+                        .ok_or_else(|| CpuError::UnsupportedOperand {
+                            address: instruction.ip32(),
+                            detail: "x87 source is not ST(i)".to_owned(),
                         })?;
                     self.x87_get(index)
                 }
@@ -1211,12 +1224,19 @@ impl Interpreter {
             Mnemonic::Fsub | Mnemonic::Fsubp => destination_value - source,
             Mnemonic::Fsubr | Mnemonic::Fsubrp => source - destination_value,
             Mnemonic::Fmul | Mnemonic::Fmulp => destination_value * source,
+            Mnemonic::Fdiv | Mnemonic::Fdivp => destination_value / source,
+            Mnemonic::Fdivr | Mnemonic::Fdivrp => source / destination_value,
             _ => unreachable!(),
         };
         self.x87_set(destination, result);
         if matches!(
             instruction.mnemonic(),
-            Mnemonic::Faddp | Mnemonic::Fsubp | Mnemonic::Fsubrp | Mnemonic::Fmulp
+            Mnemonic::Faddp
+                | Mnemonic::Fsubp
+                | Mnemonic::Fsubrp
+                | Mnemonic::Fmulp
+                | Mnemonic::Fdivp
+                | Mnemonic::Fdivrp
         ) {
             self.x87_pop();
         }
@@ -2701,6 +2721,32 @@ mod tests {
         assert_eq!(cpu.x87_get(0), 3.0);
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         assert_eq!(cpu.x87_get(0), 7.0);
+    }
+
+    #[test]
+    fn x87_arithmetic_accepts_implicit_st0_memory_forms() {
+        // fmul qword ptr [2000h]; fdiv dword ptr [2008h]; fst dword ptr [200ch]
+        let (mut cpu, mut memory) = machine(&[
+            0xdc, 0x0d, 0x00, 0x20, 0x00, 0x00, 0xd8, 0x35, 0x08, 0x20, 0x00, 0x00, 0xd9, 0x15,
+            0x0c, 0x20, 0x00, 0x00,
+        ]);
+        memory
+            .write(GuestAddress(0x2000), &2.0_f64.to_le_bytes())
+            .unwrap();
+        memory
+            .write_u32(GuestAddress(0x2008), 4.0_f32.to_bits())
+            .unwrap();
+        cpu.x87_push(3.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 6.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 1.5);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(
+            f32::from_bits(memory.read_u32(GuestAddress(0x200c)).unwrap()),
+            1.5
+        );
+        assert_eq!(cpu.x87_get(0), 1.5);
     }
 
     #[test]

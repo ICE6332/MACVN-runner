@@ -122,9 +122,12 @@ sequences rather than turning application bytes into a fatal Rust error.
 
 The current executed path has crossed `CreateWindowExA` and reached real
 resource keys such as `W0/CGS100`. Newly observed `FSQRT`, x87 arithmetic,
-`SHLD`/`SHRD`, `JECXZ`, and 64-bit `FISTP` are implemented with focused tests.
-No Guest D3D method has executed yet; the immediate frontier remains resource
-initialization before `Direct3DCreate9`.
+`SHLD`/`SHRD`, `JECXZ`, 64-bit `FISTP`, and implicit-`ST(0)` x87 memory
+arithmetic are implemented with focused tests. The latest run reaches PNG
+`gAMA` chunk processing from the real archives; `FDIV` and non-popping `FST`
+cover the latest executed gamma conversion. No Guest D3D method has executed
+yet; the immediate frontier remains image/resource initialization before
+`Direct3DCreate9`.
 
 The Host graphics substrate now uses wgpu 30 and has been verified locally to
 select a real GPU, create an RGBA render-target texture, upload pixels, and
