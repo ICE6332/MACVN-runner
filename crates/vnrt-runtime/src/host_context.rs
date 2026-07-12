@@ -895,12 +895,8 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn set_tls_value(&mut self, index: u32, value: u32) -> Result<(), Win32Error> {
-        self.tls_slots.set(
-            self.memory,
-            self.threads.current_tls_base(),
-            index,
-            value,
-        )
+        self.tls_slots
+            .set(self.memory, self.threads.current_tls_base(), index, value)
     }
 
     fn replace_unhandled_exception_filter(&mut self, filter: u32) -> u32 {
@@ -1102,11 +1098,7 @@ impl HostCallContext for RuntimeHostContext<'_> {
         {
             return Ok(*address);
         }
-        let index = u32::try_from(self.import_thunks.len()).map_err(|_| Win32Error::OutOfMemory)?;
-        let address = HOST_THUNK_BASE
-            .checked_add(index.checked_mul(4).ok_or(Win32Error::OutOfMemory)?)
-            .map(GuestAddress)
-            .ok_or(Win32Error::OutOfMemory)?;
+        let address = next_free_host_thunk(self.import_thunks).ok_or(Win32Error::OutOfMemory)?;
         self.import_thunks.insert(address, key);
         Ok(address)
     }
@@ -1288,15 +1280,14 @@ impl HostCallContext for RuntimeHostContext<'_> {
             cleanup,
         });
         // Persist the waiting thread's CPU (still mid-host-call) before switching.
-        let next = self.threads.pick_runnable_other().ok_or(Win32Error::Unsupported {
-            feature: "blocking wait without a runnable Guest worker thread",
-        })?;
-        self.threads.switch_to(
-            next,
-            &mut self.cpu.state,
-            self.last_error,
-            self.memory,
-        )?;
+        let next = self
+            .threads
+            .pick_runnable_other()
+            .ok_or(Win32Error::Unsupported {
+                feature: "blocking wait without a runnable Guest worker thread",
+            })?;
+        self.threads
+            .switch_to(next, &mut self.cpu.state, self.last_error, self.memory)?;
         self.scheduler_switched = true;
         Ok(())
     }
@@ -1335,15 +1326,14 @@ impl HostCallContext for RuntimeHostContext<'_> {
             self.cpu.state.halted = true;
             return Ok(());
         }
-        let next = self.threads.pick_runnable_any().ok_or(Win32Error::Unsupported {
-            feature: "no runnable Guest thread after ExitThread",
-        })?;
-        self.threads.switch_to(
-            next,
-            &mut self.cpu.state,
-            self.last_error,
-            self.memory,
-        )?;
+        let next = self
+            .threads
+            .pick_runnable_any()
+            .ok_or(Win32Error::Unsupported {
+                feature: "no runnable Guest thread after ExitThread",
+            })?;
+        self.threads
+            .switch_to(next, &mut self.cpu.state, self.last_error, self.memory)?;
         self.scheduler_switched = true;
         Ok(())
     }

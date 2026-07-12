@@ -126,7 +126,10 @@ impl ThreadManager {
     }
 
     pub(super) fn tls_bases(&self) -> Vec<u32> {
-        self.threads.values().map(|thread| thread.tls_base).collect()
+        self.threads
+            .values()
+            .map(|thread| thread.tls_base)
+            .collect()
     }
 
     pub(super) fn thread_is_signaled(&self, handle: Handle) -> Option<bool> {

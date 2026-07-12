@@ -1657,6 +1657,7 @@ dependencies = [
  "tracing",
  "vnrt-gfx",
  "vnrt-kernel32",
+ "vnrt-logprint",
  "vnrt-memory",
  "vnrt-pe",
  "vnrt-win32",

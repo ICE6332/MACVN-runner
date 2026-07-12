@@ -240,7 +240,9 @@ fn runs_a_pe32_guest_until_exit_process() {
         .expect("guest should reach ExitProcess");
 
     assert_eq!(outcome, RunOutcome::Exited(42));
-    assert_eq!(runtime.cpu.state.registers.esp, GUEST_STACK_TOP - 8);
+    // Process entry starts above a synthetic return slot, then ExitProcess's
+    // argument and call return address consume two more words.
+    assert_eq!(runtime.cpu.state.registers.esp, GUEST_STACK_TOP - 12);
     assert_eq!(
         runtime
             .memory
@@ -254,6 +256,28 @@ fn runs_a_pe32_guest_until_exit_process() {
             .read_u32(GuestAddress(GUEST_TLS_BASE))
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn returning_from_process_entry_exits_with_eax() {
+    let mut image = image_that_calls_exit_process(0);
+    // mov eax, 0x2a; ret
+    image[0x200..0x206].copy_from_slice(&[0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]);
+    let mut registry = ApiRegistry::new();
+    vnrt_kernel32::register(&mut registry);
+    let mut runtime = Runtime::load(&image, registry).expect("guest should load");
+
+    let outcome = runtime
+        .run(RunLimits {
+            max_instructions: 8,
+        })
+        .expect("returning process entry should terminate cleanly");
+
+    assert_eq!(outcome, RunOutcome::Exited(42));
+    assert_eq!(
+        runtime.threads.current().state,
+        GuestThreadState::Terminated
     );
 }
 
@@ -325,6 +349,31 @@ fn resumes_a_suspended_host_call_after_guest_stdcall_callback() {
     assert_eq!(runtime.cpu.state.registers.eax, 0xcafe_babe);
     assert_eq!(runtime.cpu.state.registers.esp, GUEST_STACK_TOP);
     assert!(runtime.suspended_host_calls.is_empty());
+}
+
+#[test]
+fn logprint_test_cleans_its_thirteen_arguments() {
+    let image = image_with_one_import();
+    let mut registry = ApiRegistry::new();
+    vnrt_logprint::register(&mut registry);
+    let mut runtime = Runtime::load(&image, registry).expect("guest should load");
+    runtime.register_import_thunk(
+        GuestAddress(HOST_THUNK_BASE),
+        ApiKey::new("logprint.dll", "Test"),
+    );
+
+    let stack = GUEST_STACK_TOP - 4 * 14;
+    runtime.cpu.state.registers.esp = stack;
+    runtime
+        .memory
+        .write_u32(GuestAddress(stack), 0x0040_1234)
+        .unwrap();
+    runtime
+        .dispatch_host_call(GuestAddress(HOST_THUNK_BASE))
+        .expect("logprint Test should return successfully");
+
+    assert_eq!(runtime.cpu.state.registers.eip, 0x0040_1234);
+    assert_eq!(runtime.cpu.state.registers.esp, GUEST_STACK_TOP);
 }
 
 #[test]
@@ -880,6 +929,24 @@ fn image_with_one_import() -> Vec<u8> {
     image[0x260..0x26b].copy_from_slice(b"USER32.dll\0");
     image[0x270..0x27e].copy_from_slice(b"\0\0MessageBoxA\0");
     image
+}
+
+#[test]
+fn host_thunk_allocation_fills_holes_without_overwriting_live_slots() {
+    let first = GuestAddress(HOST_THUNK_BASE);
+    let occupied_after_hole = GuestAddress(HOST_THUNK_BASE + 8);
+    let mut thunks = HashMap::from([
+        (first, ApiKey::new("a.dll", "First")),
+        (occupied_after_hole, ApiKey::new("b.dll", "StillLive")),
+    ]);
+
+    let allocated = next_free_host_thunk(&thunks).expect("one thunk slot should remain free");
+    assert_eq!(allocated, GuestAddress(HOST_THUNK_BASE + 4));
+    thunks.insert(allocated, ApiKey::new("c.dll", "New"));
+    assert_eq!(
+        thunks.get(&occupied_after_hole),
+        Some(&ApiKey::new("b.dll", "StillLive"))
+    );
 }
 
 fn assert_host_thunk(runtime: &Runtime, module: &str, name: &str) {

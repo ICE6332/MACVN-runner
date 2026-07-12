@@ -13,7 +13,7 @@ This is not Wine and is not intended to run arbitrary Windows software.
 - The primary Chinese `euphoriaCN.exe` target now unpacks its child, opens the real YPF archives, creates its modeled main window, and enters real resource lookup.
 - Read-only archives stream from Host files, so the 1.6 GB `cg.ypf` is no longer copied into RAM.
 - Cooperative Guest threads cover `CreateThread`/`ResumeThread`, blocking `WaitFor*`, and `SetEvent` wakeups for the post-resource worker kickoff without Host-native threads.
-- Post-wait path reaches window show and a GDI DC probe; the live frontier is a null execute (`AV at 0`) before `Direct3DCreate9`.
+- Post-wait path now survives window show and the first GDI/logprint probe; the former null execute was a 52-byte `logprint!Test` ABI cleanup mismatch. The next frontier is the longer post-probe path toward first presentation.
 
 Game files are not included. Use only files you are legally allowed to run.
 

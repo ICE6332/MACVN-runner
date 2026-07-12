@@ -160,13 +160,15 @@ Observed post-scheduler startup path (release, ~5B steps / ~3 minutes wall):
 4. Window placement (`MoveWindow` / `SetWindowPos`) and `ShowWindow`.
 5. `GetDC` → `SetStretchBltMode` → optional `logprint!Test` → `ReleaseDC`.
 
-The current dynamic frontier is an **execute access violation at address 0**
-immediately after that DC probe sequence (status `0xC0000005`). Guest SEH runs
-two frames, reaches `UnhandledExceptionFilter`, then a nested fault at EIP
-`0x6` while dispatch is still active. No `Direct3DCreate9` host call has been
-observed yet; D3D creation remains the documented next product milestone once
-this null call site is explained (missing export, bad decoded function pointer,
-or incomplete Guest state after the DC probe).
+The former execute access violation at address 0 after this sequence was an ABI
+error, not a missing GDI call. Runtime instruction and control-transfer tracing
+showed that `logprint!Test` receives thirteen DWORD arguments and must clean 52
+bytes. The zero-cleanup placeholder left ESP at `0x7feffe74`; correct cleanup
+returns through the saved `0x40f879` address at `0x7feffea8`. With that fixed,
+the target survives the old fault and continues through a longer CPU-heavy path
+for more than eight minutes without presenting a frame. No
+`Direct3DCreate9` host call has been confirmed yet; the next run should use a
+bounded instruction/API profile to identify the new frontier efficiently.
 
 `DecodePointer(NULL)` now returns NULL (Encode still cookie-xors null to a
 non-null token), matching native CRT expectations for empty handler slots.

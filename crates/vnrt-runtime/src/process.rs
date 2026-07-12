@@ -167,13 +167,8 @@ pub(super) fn initialize_host_module_image(
         {
             *address
         } else {
-            let thunk_index = u32::try_from(import_thunks.len())
-                .map_err(|_| RuntimeError::Unsupported("Host thunk table overflow"))?;
-            let address = GuestAddress(
-                HOST_THUNK_BASE
-                    .checked_add(thunk_index.saturating_mul(4))
-                    .ok_or(RuntimeError::Unsupported("Host thunk table overflow"))?,
-            );
+            let address = next_free_host_thunk(import_thunks)
+                .ok_or(RuntimeError::Unsupported("Host thunk table overflow"))?;
             import_thunks.insert(address, key.clone());
             address
         };
@@ -223,6 +218,22 @@ pub(super) fn initialize_host_module_image(
     )?;
     memory.protect_range(base, HOST_MODULE_IMAGE_SIZE, Permissions::READ)?;
     Ok(())
+}
+
+/// Find an unused Host thunk slot without assuming the address map is dense.
+///
+/// Dynamic export resolution and explicit thunk registration can create holes.
+/// Using `HashMap::len()` as an address index can then overwrite a live slot and
+/// silently change the ABI/stack cleanup of an already-bound Guest IAT entry.
+pub(super) fn next_free_host_thunk(
+    import_thunks: &HashMap<GuestAddress, ApiKey>,
+) -> Option<GuestAddress> {
+    let slot_count = HOST_THUNK_REGION_SIZE / 4;
+    (0..slot_count).find_map(|index| {
+        let address = HOST_THUNK_BASE.checked_add(index.checked_mul(4)?)?;
+        let address = GuestAddress(address);
+        (!import_thunks.contains_key(&address)).then_some(address)
+    })
 }
 
 pub(super) fn initialize_host_modules(
@@ -370,6 +381,24 @@ pub(super) fn enter_tls_callback(
     memory.write_u32(GuestAddress(frame + 12), 0)?;
     cpu.state.registers.esp = frame;
     cpu.state.registers.eip = callback.0;
+    Ok(())
+}
+
+/// Enter the PE process entry point through the same termination boundary the
+/// native Win32 startup wrapper provides. A process entry point is a normal
+/// function: returning its value must terminate the initial thread/process,
+/// not fetch an uninitialized return address from the top of the Guest stack.
+pub(super) fn enter_main_entry_point(
+    cpu: &mut Interpreter,
+    memory: &mut GuestMemory,
+    entry_point: GuestAddress,
+) -> Result<(), RuntimeError> {
+    let return_slot = GUEST_STACK_TOP
+        .checked_sub(4)
+        .ok_or(RuntimeError::Unsupported("process entry stack underflow"))?;
+    memory.write_u32(GuestAddress(return_slot), THREAD_EXIT_RETURN_ADDRESS)?;
+    cpu.state.registers.esp = return_slot;
+    cpu.state.registers.eip = entry_point.0;
     Ok(())
 }
 

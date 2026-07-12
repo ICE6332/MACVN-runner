@@ -22,6 +22,7 @@ vnrt-x86 = { path = "../vnrt-x86" }
 
 [dev-dependencies]
 vnrt-kernel32 = { path = "../vnrt-kernel32" }
+vnrt-logprint = { path = "../vnrt-logprint" }
 
 [lints]
 workspace = true

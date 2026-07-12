@@ -17,7 +17,10 @@ use vnrt_memory::{AccessKind, GuestAddress, GuestMemory, MemoryError, PAGE_SIZE,
 
 /// Maximum length of one x86 instruction.
 pub const MAX_INSTRUCTION_LEN: usize = 15;
+// General history stays small; opt-in range tracing retains relevant transfers
+// separately so packed-game helper calls cannot evict the interesting entry.
 const CONTROL_TRANSFER_HISTORY_LIMIT: usize = 512;
+const TARGETED_CONTROL_TRANSFER_HISTORY_LIMIT: usize = 512;
 const INSTRUCTION_TRACE_LIMIT: usize = 256;
 
 /// One decoded instruction retained by an opt-in address-range trace.
@@ -428,6 +431,7 @@ pub struct Interpreter {
     block_cache: HashMap<u32, Arc<CachedBlock>>,
     block_hotness: HashMap<u32, u8>,
     recent_control_transfers: VecDeque<ControlTransfer>,
+    targeted_control_transfers: VecDeque<ControlTransfer>,
     trace_range: Option<(u32, u32)>,
     traced_instructions: VecDeque<TracedInstruction>,
 }
@@ -457,6 +461,9 @@ impl Interpreter {
             block_cache: HashMap::new(),
             block_hotness: HashMap::new(),
             recent_control_transfers: VecDeque::with_capacity(CONTROL_TRANSFER_HISTORY_LIMIT),
+            targeted_control_transfers: VecDeque::with_capacity(
+                TARGETED_CONTROL_TRANSFER_HISTORY_LIMIT,
+            ),
             trace_range: None,
             traced_instructions: VecDeque::with_capacity(INSTRUCTION_TRACE_LIMIT),
         }
@@ -472,12 +479,19 @@ impl Interpreter {
     pub fn set_trace_range(&mut self, range: Option<(u32, u32)>) {
         self.trace_range = range;
         self.traced_instructions.clear();
+        self.targeted_control_transfers.clear();
     }
 
     /// Instructions captured by the configured range in execution order.
     #[must_use]
     pub fn traced_instructions(&self) -> &VecDeque<TracedInstruction> {
         &self.traced_instructions
+    }
+
+    /// Control transfers whose source or target touched the configured trace range.
+    #[must_use]
+    pub fn targeted_control_transfers(&self) -> &VecDeque<ControlTransfer> {
+        &self.targeted_control_transfers
     }
 
     /// Execute one instruction or report an external call boundary.
@@ -988,15 +1002,25 @@ impl Interpreter {
             Mnemonic::Punpckhdq => self.execute_mmx_punpck(memory, instruction, PunpckKind::Hdq)?,
             Mnemonic::Packuswb => self.execute_mmx_packuswb(memory, instruction)?,
             Mnemonic::Packssdw => self.execute_mmx_packssdw(memory, instruction)?,
-            Mnemonic::Psrlw => self.execute_mmx_shift_words(memory, instruction, ShiftDir::Right)?,
+            Mnemonic::Psrlw => {
+                self.execute_mmx_shift_words(memory, instruction, ShiftDir::Right)?
+            }
             Mnemonic::Psllw => self.execute_mmx_shift_words(memory, instruction, ShiftDir::Left)?,
-            Mnemonic::Psrld => self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Right)?,
-            Mnemonic::Pslld => self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Left)?,
-            Mnemonic::Psrlq => self.execute_mmx_shift_qword(memory, instruction, ShiftDir::Right)?,
+            Mnemonic::Psrld => {
+                self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Right)?
+            }
+            Mnemonic::Pslld => {
+                self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Left)?
+            }
+            Mnemonic::Psrlq => {
+                self.execute_mmx_shift_qword(memory, instruction, ShiftDir::Right)?
+            }
             Mnemonic::Psllq => self.execute_mmx_shift_qword(memory, instruction, ShiftDir::Left)?,
             Mnemonic::Paddw => self.execute_mmx_word_arith(memory, instruction, WordArith::Add)?,
             Mnemonic::Psubw => self.execute_mmx_word_arith(memory, instruction, WordArith::Sub)?,
-            Mnemonic::Pmullw => self.execute_mmx_word_arith(memory, instruction, WordArith::MulLow)?,
+            Mnemonic::Pmullw => {
+                self.execute_mmx_word_arith(memory, instruction, WordArith::MulLow)?
+            }
             Mnemonic::Paddsw => {
                 self.execute_mmx_word_arith(memory, instruction, WordArith::AddSatSigned)?
             }
@@ -1259,15 +1283,24 @@ impl Interpreter {
         stack_pointer: u32,
         kind: ControlTransferKind,
     ) {
-        if self.recent_control_transfers.len() == CONTROL_TRANSFER_HISTORY_LIMIT {
-            self.recent_control_transfers.pop_front();
-        }
-        self.recent_control_transfers.push_back(ControlTransfer {
+        let transfer = ControlTransfer {
             source,
             target,
             stack_pointer,
             kind,
-        });
+        };
+        if self.trace_range.is_some_and(|(start, end)| {
+            (start..end).contains(&source) || (start..end).contains(&target)
+        }) {
+            if self.targeted_control_transfers.len() == TARGETED_CONTROL_TRANSFER_HISTORY_LIMIT {
+                self.targeted_control_transfers.pop_front();
+            }
+            self.targeted_control_transfers.push_back(transfer);
+        }
+        if self.recent_control_transfers.len() == CONTROL_TRANSFER_HISTORY_LIMIT {
+            self.recent_control_transfers.pop_front();
+        }
+        self.recent_control_transfers.push_back(transfer);
     }
 
     fn x87_pop(&mut self) {
@@ -2641,10 +2674,10 @@ impl Interpreter {
         let source = self.read_mmx_or_memory(memory, instruction, 1)?;
         let dest = self.state.mmx_registers[destination];
         let mut bytes = [0_u8; 8];
-        for index in 0..8 {
+        for (index, byte) in bytes.iter_mut().enumerate() {
             let left = (dest >> (8 * index)) as u8;
             let right = (source >> (8 * index)) as u8;
-            bytes[index] = if predicate(left, right) { 0xff } else { 0 };
+            *byte = if predicate(left, right) { 0xff } else { 0 };
         }
         self.state.mmx_registers[destination] = u64::from_le_bytes(bytes);
         self.state.registers.eip = instruction.next_ip32();
@@ -3147,8 +3180,8 @@ fn unpack_interleave_bytes(dest: u64, source: u64, low: bool) -> u64 {
     let shift = if low { 0 } else { 32 };
     let mut result = 0_u64;
     for index in 0..4 {
-        let d = ((dest >> (shift + 8 * index)) & 0xff) as u64;
-        let s = ((source >> (shift + 8 * index)) & 0xff) as u64;
+        let d = (dest >> (shift + 8 * index)) & 0xff;
+        let s = (source >> (shift + 8 * index)) & 0xff;
         result |= d << (16 * index);
         result |= s << (16 * index + 8);
     }
@@ -3157,10 +3190,10 @@ fn unpack_interleave_bytes(dest: u64, source: u64, low: bool) -> u64 {
 
 fn unpack_interleave_words(dest: u64, source: u64, low: bool) -> u64 {
     let shift = if low { 0 } else { 32 };
-    let d0 = ((dest >> shift) & 0xffff) as u64;
-    let d1 = ((dest >> (shift + 16)) & 0xffff) as u64;
-    let s0 = ((source >> shift) & 0xffff) as u64;
-    let s1 = ((source >> (shift + 16)) & 0xffff) as u64;
+    let d0 = (dest >> shift) & 0xffff;
+    let d1 = (dest >> (shift + 16)) & 0xffff;
+    let s0 = (source >> shift) & 0xffff;
+    let s1 = (source >> (shift + 16)) & 0xffff;
     d0 | (s0 << 16) | (d1 << 32) | (s1 << 48)
 }
 
@@ -4026,26 +4059,26 @@ mod tests {
     fn records_indirect_call_and_return_targets() {
         // mov eax,1008h; call eax; hlt; ret
         let (mut cpu, mut memory) = machine(&[0xb8, 0x08, 0x10, 0, 0, 0xff, 0xd0, 0xf4, 0xc3]);
+        cpu.set_trace_range(Some((0x1008, 0x1009)));
         for _ in 0..4 {
             cpu.step(&mut memory, &NoExternalTargets).unwrap();
         }
-        assert_eq!(
-            cpu.recent_control_transfers(),
-            vec![
-                ControlTransfer {
-                    source: 0x1005,
-                    target: 0x1008,
-                    stack_pointer: 0x3000,
-                    kind: ControlTransferKind::Call,
-                },
-                ControlTransfer {
-                    source: 0x1008,
-                    target: 0x1007,
-                    stack_pointer: 0x2ffc,
-                    kind: ControlTransferKind::Return,
-                },
-            ]
-        );
+        let expected = vec![
+            ControlTransfer {
+                source: 0x1005,
+                target: 0x1008,
+                stack_pointer: 0x3000,
+                kind: ControlTransferKind::Call,
+            },
+            ControlTransfer {
+                source: 0x1008,
+                target: 0x1007,
+                stack_pointer: 0x2ffc,
+                kind: ControlTransferKind::Return,
+            },
+        ];
+        assert_eq!(cpu.recent_control_transfers(), expected);
+        assert_eq!(cpu.targeted_control_transfers(), &expected);
     }
 
     #[test]

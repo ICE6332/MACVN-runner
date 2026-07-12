@@ -404,6 +404,7 @@ impl Runtime {
             )?;
             true
         } else {
+            enter_main_entry_point(&mut cpu, &mut memory, main_entry_point)?;
             false
         };
         let process_io = ProcessIo::sandboxed(config.filesystem_root, &config.current_directory);
@@ -500,6 +501,18 @@ impl Runtime {
     /// Associate a guest import thunk with a registered API name.
     pub fn register_import_thunk(&mut self, address: GuestAddress, api: ApiKey) {
         self.import_thunks.insert(address, api);
+    }
+
+    /// Look up one synthetic Host module for loader/debugger diagnostics.
+    #[must_use]
+    pub fn host_module_handle(&self, name: &str) -> Option<GuestAddress> {
+        self.host_modules.get(&name.to_ascii_lowercase()).copied()
+    }
+
+    /// Identify the Host API dispatched by one executable thunk address.
+    #[must_use]
+    pub fn host_api_at(&self, address: GuestAddress) -> Option<&ApiKey> {
+        self.import_thunks.get(&address)
     }
 
     /// Capture the current machine state without mutating guest execution.
@@ -740,9 +753,12 @@ impl Runtime {
             self.cpu.state.halted = true;
             return Ok(());
         }
-        let next = self.threads.pick_runnable_any().ok_or(RuntimeError::Unsupported(
-            "no runnable Guest thread after ExitThread",
-        ))?;
+        let next = self
+            .threads
+            .pick_runnable_any()
+            .ok_or(RuntimeError::Unsupported(
+                "no runnable Guest thread after ExitThread",
+            ))?;
         self.threads.switch_to(
             next,
             &mut self.cpu.state,
@@ -788,7 +804,7 @@ impl Runtime {
             enter_tls_callback(&mut self.cpu, &mut self.memory, callback, self.image_base)?;
         } else {
             self.tls_callbacks_active = false;
-            self.cpu.state.registers.eip = self.main_entry_point.0;
+            enter_main_entry_point(&mut self.cpu, &mut self.memory, self.main_entry_point)?;
         }
         Ok(())
     }

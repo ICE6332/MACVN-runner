@@ -37,22 +37,7 @@ fn main() -> Result<ExitCode> {
     let bytes = fs::read(&arguments.path)
         .with_context(|| format!("failed to read {}", arguments.path.display()))?;
 
-    let mut registry = ApiRegistry::new();
-    vnrt_advapi32::register(&mut registry);
-    vnrt_comctl32::register(&mut registry);
-    vnrt_d3d9::register(&mut registry);
-    vnrt_dsound::register(&mut registry);
-    vnrt_gdi32::register(&mut registry);
-    vnrt_imm32::register(&mut registry);
-    vnrt_kernel32::register(&mut registry);
-    vnrt_logprint::register(&mut registry);
-    vnrt_ntdll::register(&mut registry);
-    vnrt_ole32::register(&mut registry);
-    vnrt_psapi::register(&mut registry);
-    vnrt_shell32::register(&mut registry);
-    vnrt_user32::register(&mut registry);
-    vnrt_version::register(&mut registry);
-    vnrt_winmm::register(&mut registry);
+    let registry = build_registry();
     let file_name = arguments
         .path
         .file_name()
@@ -113,7 +98,9 @@ fn main() -> Result<ExitCode> {
                 control_transfer_previews = ?control_transfer_previews(&runtime, &snapshot),
                 matching_stack_transfers = ?matching_stack_transfers(&runtime, &snapshot),
                 recent_executable_writes = ?runtime.memory.executable_writes().iter().rev().take(64).collect::<Vec<_>>(),
+                executable_write_source_previews = ?executable_write_source_previews(&runtime),
                 traced_instructions = ?runtime.cpu.traced_instructions(),
+                targeted_control_transfers = ?runtime.cpu.targeted_control_transfers(),
                 "guest execution failed"
             );
             emit_guest_output(&runtime)?;
@@ -159,6 +146,26 @@ fn main() -> Result<ExitCode> {
         RunOutcome::Exited(code) => ExitCode::from(code.to_le_bytes()[0]),
         RunOutcome::Halted | RunOutcome::FramePresented(_) => ExitCode::SUCCESS,
     })
+}
+
+fn build_registry() -> ApiRegistry {
+    let mut registry = ApiRegistry::new();
+    vnrt_advapi32::register(&mut registry);
+    vnrt_comctl32::register(&mut registry);
+    vnrt_d3d9::register(&mut registry);
+    vnrt_dsound::register(&mut registry);
+    vnrt_gdi32::register(&mut registry);
+    vnrt_imm32::register(&mut registry);
+    vnrt_kernel32::register(&mut registry);
+    vnrt_logprint::register(&mut registry);
+    vnrt_ntdll::register(&mut registry);
+    vnrt_ole32::register(&mut registry);
+    vnrt_psapi::register(&mut registry);
+    vnrt_shell32::register(&mut registry);
+    vnrt_user32::register(&mut registry);
+    vnrt_version::register(&mut registry);
+    vnrt_winmm::register(&mut registry);
+    registry
 }
 
 fn memory_window(runtime: &Runtime, center: u32, before: u32, length: usize) -> String {
@@ -274,6 +281,18 @@ fn matching_stack_transfers(runtime: &Runtime, snapshot: &DiagnosticSnapshot) ->
         .collect()
 }
 
+fn executable_write_source_previews(runtime: &Runtime) -> Vec<String> {
+    runtime
+        .memory
+        .executable_writes()
+        .iter()
+        .rev()
+        .filter_map(|write| write.source)
+        .take(16)
+        .map(|source| memory_window(runtime, source.0, 24, 64))
+        .collect()
+}
+
 fn emit_guest_output(runtime: &Runtime) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(runtime.guest_stdout())?;
@@ -289,4 +308,82 @@ fn format_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_gdi_export_dispatches_to_stretch_dibits() {
+        let image = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/guest-programs/exit42.exe"
+        ));
+        let runtime = Runtime::load(image, build_registry()).expect("runtime should load");
+        let module = runtime
+            .host_module_handle("gdi32.dll")
+            .expect("synthetic gdi32 should exist");
+        let address = find_export(&runtime, module, "StretchDIBits");
+        assert_eq!(
+            runtime.host_api_at(address),
+            Some(&vnrt_win32::ApiKey::new("gdi32.dll", "StretchDIBits"))
+        );
+    }
+
+    fn find_export(runtime: &Runtime, module: GuestAddress, target: &str) -> GuestAddress {
+        let pe = module.0 + 0x80;
+        let directory = module.0 + runtime.memory.read_u32(GuestAddress(pe + 0x78)).unwrap();
+        let name_count = runtime
+            .memory
+            .read_u32(GuestAddress(directory + 24))
+            .unwrap();
+        let functions = module.0
+            + runtime
+                .memory
+                .read_u32(GuestAddress(directory + 28))
+                .unwrap();
+        let names = module.0
+            + runtime
+                .memory
+                .read_u32(GuestAddress(directory + 32))
+                .unwrap();
+        let ordinals = module.0
+            + runtime
+                .memory
+                .read_u32(GuestAddress(directory + 36))
+                .unwrap();
+        for index in 0..name_count {
+            let name_rva = runtime
+                .memory
+                .read_u32(GuestAddress(names + index * 4))
+                .unwrap();
+            let mut bytes = Vec::new();
+            for offset in 0..256 {
+                let mut byte = [0];
+                runtime
+                    .memory
+                    .read(GuestAddress(module.0 + name_rva + offset), &mut byte)
+                    .unwrap();
+                if byte[0] == 0 {
+                    break;
+                }
+                bytes.push(byte[0]);
+            }
+            if bytes == target.as_bytes() {
+                let ordinal = u32::from(
+                    runtime
+                        .memory
+                        .read_u16(GuestAddress(ordinals + index * 2))
+                        .unwrap(),
+                );
+                let function_rva = runtime
+                    .memory
+                    .read_u32(GuestAddress(functions + ordinal * 4))
+                    .unwrap();
+                return GuestAddress(module.0 + function_rva);
+            }
+        }
+        panic!("missing synthetic export {target}");
+    }
 }
