@@ -243,8 +243,14 @@ pub fn register(registry: &mut ApiRegistry) {
         LoadLibrary { wide: true },
     );
     registry.register(ApiKey::new(MODULE, "FreeLibrary"), FreeLibrary);
-    registry.register(ApiKey::new(MODULE, "EncodePointer"), PointerCodec);
-    registry.register(ApiKey::new(MODULE, "DecodePointer"), PointerCodec);
+    registry.register(
+        ApiKey::new(MODULE, "EncodePointer"),
+        PointerCodec { decode: false },
+    );
+    registry.register(
+        ApiKey::new(MODULE, "DecodePointer"),
+        PointerCodec { decode: true },
+    );
     for (name, operation) in [
         ("InterlockedIncrement", InterlockedOperation::Increment),
         ("InterlockedDecrement", InterlockedOperation::Decrement),
@@ -510,20 +516,39 @@ impl HostCallHandler for Sleep {
 impl HostCallHandler for ExitThread {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
         let exit_code = context.argument_u32(0)?;
-        // Until multiple Guest contexts exist, the initial thread owns the
-        // process and exiting it terminates the runtime.
-        context.request_exit(exit_code);
+        // Cooperative scheduler: workers yield to another Ready thread; the
+        // initial thread still terminates the process.
+        context.exit_guest_thread(exit_code)?;
         Ok(())
     }
 }
 
 impl HostCallHandler for CreateThread {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        // Export probing must not confuse "missing API" with "threading not
-        // initialized". Actual Guest thread creation remains a scheduler-level
-        // feature and is reported explicitly when invoked.
-        context.set_last_error(50); // ERROR_NOT_SUPPORTED
-        context.set_return_u32(0);
+        if context.argument_u32(0)? != 0 {
+            return Err(Win32Error::Unsupported {
+                feature: "CreateThread security attributes",
+            });
+        }
+        let stack_size = context.argument_u32(1)?;
+        let start_address = GuestAddress(context.argument_u32(2)?);
+        let parameter = context.argument_u32(3)?;
+        let creation_flags = context.argument_u32(4)?;
+        let thread_id_out = GuestAddress(context.argument_u32(5)?);
+        match context.create_guest_thread(start_address, parameter, stack_size, creation_flags) {
+            Ok((handle, thread_id)) => {
+                if thread_id_out.0 != 0 {
+                    context.write_memory(thread_id_out, &thread_id.to_le_bytes())?;
+                }
+                context.set_last_error(0);
+                context.set_return_u32(handle.0);
+            }
+            Err(Win32Error::OutOfMemory) => {
+                context.set_last_error(8); // ERROR_NOT_ENOUGH_MEMORY
+                context.set_return_u32(0);
+            }
+            Err(error) => return Err(error),
+        }
         context.set_stdcall_cleanup(24);
         Ok(())
     }
@@ -543,13 +568,16 @@ impl HostCallHandler for CreateProcess {
 
 impl HostCallHandler for ResumeThread {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        let thread = context.argument_u32(0)?;
-        if thread != u32::MAX - 1 {
-            context.set_last_error(6); // ERROR_INVALID_HANDLE
-            context.set_return_u32(u32::MAX);
-        } else {
-            context.set_last_error(0);
-            context.set_return_u32(0); // previous suspend count
+        let thread = Handle(context.argument_u32(0)?);
+        match context.resume_guest_thread(thread) {
+            Ok(previous) => {
+                context.set_last_error(0);
+                context.set_return_u32(previous);
+            }
+            Err(_) => {
+                context.set_last_error(6); // ERROR_INVALID_HANDLE
+                context.set_return_u32(u32::MAX);
+            }
         }
         context.set_stdcall_cleanup(4);
         Ok(())
@@ -1894,22 +1922,25 @@ impl HostCallHandler for WaitForObjects {
             Ok(Some(index)) => {
                 context.set_last_error(0);
                 context.set_return_u32(index);
+                context.set_stdcall_cleanup(cleanup);
             }
             Ok(None) if timeout == 0 => {
                 context.set_last_error(0);
-                context.set_return_u32(258);
+                context.set_return_u32(258); // WAIT_TIMEOUT
+                context.set_stdcall_cleanup(cleanup);
             }
             Ok(None) => {
-                return Err(Win32Error::Unsupported {
-                    feature: "blocking wait without a Guest thread scheduler",
-                });
+                // Park this Guest thread and run a Ready worker cooperatively.
+                // The scheduler completes the stdcall return when the wait is
+                // later satisfied, so do not finish the frame here.
+                context.park_wait_and_schedule(&handles, wait_all, cleanup)?;
             }
             Err(_) => {
                 context.set_last_error(6);
                 context.set_return_u32(u32::MAX);
+                context.set_stdcall_cleanup(cleanup);
             }
         }
-        context.set_stdcall_cleanup(cleanup);
         Ok(())
     }
 }
@@ -2161,7 +2192,9 @@ struct LoadLibrary {
 struct FreeLibrary;
 
 #[derive(Debug, Clone, Copy)]
-struct PointerCodec;
+struct PointerCodec {
+    decode: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum InterlockedOperation {
@@ -2179,12 +2212,17 @@ struct Interlocked {
 
 impl HostCallHandler for PointerCodec {
     fn invoke(&self, context: &mut dyn HostCallContext) -> Result<(), Win32Error> {
-        // A stable per-runtime cookie is sufficient for the observable Win32
-        // contract here: encoded pointers are opaque and DecodePointer must
-        // invert EncodePointer. XOR also maps null to a non-null token, as the
-        // native API does.
+        // Stable per-runtime cookie is enough for CRT pointer obfuscation.
+        // EncodePointer(NULL) becomes a non-null token; DecodePointer(NULL) must
+        // remain NULL so empty SAFESEH/CRT slots are not turned into callables.
         const POINTER_COOKIE: u32 = 0xA5C3_1F27;
-        context.set_return_u32(context.argument_u32(0)? ^ POINTER_COOKIE);
+        let pointer = context.argument_u32(0)?;
+        let result = if self.decode && pointer == 0 {
+            0
+        } else {
+            pointer ^ POINTER_COOKIE
+        };
+        context.set_return_u32(result);
         context.set_stdcall_cleanup(4);
         Ok(())
     }

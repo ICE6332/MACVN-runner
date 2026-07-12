@@ -1299,6 +1299,28 @@ pub trait HostCallContext {
         handles: &[Handle],
         wait_all: bool,
     ) -> Result<Option<u32>, Win32Error>;
+    /// Park the current Guest thread on a blocking wait and schedule another.
+    ///
+    /// On success the cooperative scheduler has switched Guest contexts; the
+    /// Host call must not complete the original stdcall return frame.
+    fn park_wait_and_schedule(
+        &mut self,
+        handles: &[Handle],
+        wait_all: bool,
+        cleanup: u32,
+    ) -> Result<(), Win32Error>;
+    /// Create a cooperative Guest worker thread.
+    fn create_guest_thread(
+        &mut self,
+        start_address: GuestAddress,
+        parameter: u32,
+        stack_size: u32,
+        creation_flags: u32,
+    ) -> Result<(Handle, u32), Win32Error>;
+    /// Decrement a Guest thread's suspend count and return the previous count.
+    fn resume_guest_thread(&mut self, handle: Handle) -> Result<u32, Win32Error>;
+    /// Terminate the current Guest thread. The initial thread exits the process.
+    fn exit_guest_thread(&mut self, exit_code: u32) -> Result<(), Win32Error>;
     /// Begin one wildcard filesystem search.
     fn find_first_file(&mut self, pattern: &str) -> Result<(Handle, FileEntry), Win32Error>;
     /// Advance one wildcard filesystem search.

@@ -11,7 +11,9 @@ This is not Wine and is not intended to run arbitrary Windows software.
 - A backend-neutral graphics layer now owns real wgpu textures; wgpu selects Metal on macOS while leaving Vulkan, D3D12, and GLES available on other hosts.
 - A bounded Host media layer normalizes PNG/JPEG/BMP/GIF/WebP/TGA/TIFF/ICO/DDS to RGBA8 and WAV/OGG/MP3/FLAC/AAC/M4A/AIFF to interleaved f32 PCM.
 - The primary Chinese `euphoriaCN.exe` target now unpacks its child, opens the real YPF archives, creates its modeled main window, and enters real resource lookup.
-- Read-only archives stream from Host files, so the 1.6 GB `cg.ypf` is no longer copied into RAM. The current frontier is an x87 resource-initialization path; no Guest D3D method has executed yet.
+- Read-only archives stream from Host files, so the 1.6 GB `cg.ypf` is no longer copied into RAM.
+- Cooperative Guest threads cover `CreateThread`/`ResumeThread`, blocking `WaitFor*`, and `SetEvent` wakeups for the post-resource worker kickoff without Host-native threads.
+- Post-wait path reaches window show and a GDI DC probe; the live frontier is a null execute (`AV at 0`) before `Direct3DCreate9`.
 
 Game files are not included. Use only files you are legally allowed to run.
 

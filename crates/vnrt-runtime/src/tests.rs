@@ -608,6 +608,247 @@ fn runs_optimized_compiler_generated_pe32_fixture() {
     assert!(runtime.virtual_memory.is_empty());
 }
 
+#[test]
+fn cooperative_wait_runs_worker_then_resumes_main() {
+    let image = image_that_calls_exit_process(1);
+    let mut registry = ApiRegistry::new();
+    vnrt_kernel32::register(&mut registry);
+    let mut runtime = Runtime::load(&image, registry).expect("guest should load");
+
+    // Worker ThreadProc: mov eax, 0x77; ret 4
+    runtime
+        .memory
+        .map_range(GuestAddress(0x0030_0000), 0x1000, Permissions::ALL)
+        .unwrap();
+    runtime
+        .memory
+        .write(
+            GuestAddress(0x0030_0000),
+            &[0xb8, 0x77, 0x00, 0x00, 0x00, 0xc2, 0x04, 0x00],
+        )
+        .unwrap();
+
+    let (handle, thread_id) = {
+        let mut context = test_host_context(&mut runtime);
+        context
+            .create_guest_thread(GuestAddress(0x0030_0000), 0, 0, 0)
+            .expect("CreateThread should succeed")
+    };
+    assert_ne!(handle.0, 0);
+    assert_ne!(thread_id, GUEST_THREAD_ID);
+    assert_eq!(runtime.threads.current_id(), GUEST_THREAD_ID);
+
+    // Fabricate a WaitForSingleObject frame: [esp]=return, handle, timeout.
+    // Return into a HLT so the run loop stops cleanly after the wait resumes.
+    runtime
+        .memory
+        .map_range(GuestAddress(0x0031_0000), 0x1000, Permissions::ALL)
+        .unwrap();
+    runtime
+        .memory
+        .write(GuestAddress(0x0031_0000), &[0xf4])
+        .unwrap();
+    let wait_frame = GUEST_STACK_TOP - 12;
+    runtime.cpu.state.registers.esp = wait_frame;
+    runtime
+        .memory
+        .write_u32(GuestAddress(wait_frame), 0x0031_0000)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(wait_frame + 4), handle.0)
+        .unwrap();
+    runtime
+        .memory
+        .write_u32(GuestAddress(wait_frame + 8), u32::MAX)
+        .unwrap();
+
+    // Park main on the worker thread handle (not yet signalled).
+    {
+        let mut context = test_host_context(&mut runtime);
+        context
+            .park_wait_and_schedule(&[handle], true, 8)
+            .expect("wait should switch to the Ready worker");
+    }
+    assert_eq!(runtime.threads.current_id(), thread_id);
+    assert_eq!(runtime.cpu.state.registers.eip, 0x0030_0000);
+
+    // Run the worker until it returns through the thread-exit trampoline and
+    // the scheduler resumes the waiting main thread into HLT.
+    let outcome = runtime
+        .run(RunLimits {
+            max_instructions: 32,
+        })
+        .expect("worker should complete and wake main");
+    assert_eq!(outcome, RunOutcome::Halted);
+    assert_eq!(runtime.threads.current_id(), GUEST_THREAD_ID);
+    assert_eq!(runtime.cpu.state.registers.eax, 0); // WAIT_OBJECT_0
+    assert_eq!(runtime.cpu.state.registers.eip, 0x0031_0001); // after HLT
+    assert_eq!(runtime.threads.current().state, GuestThreadState::Running);
+}
+
+#[test]
+fn cooperative_setevent_wakes_waiter_across_threads() {
+    let image = image_that_calls_exit_process(1);
+    let mut registry = ApiRegistry::new();
+    vnrt_kernel32::register(&mut registry);
+    let mut runtime = Runtime::load(&image, registry).expect("guest should load");
+
+    let event = {
+        let mut context = test_host_context(&mut runtime);
+        let (handle, existed) = context.create_event(None, false, false).unwrap();
+        assert!(!existed);
+        handle
+    };
+
+    // Worker: return immediately; the interesting work is SetEvent from a
+    // Host call issued while the worker is current after the main thread parks.
+    runtime
+        .memory
+        .map_range(GuestAddress(0x0030_0000), 0x1000, Permissions::ALL)
+        .unwrap();
+    runtime
+        .memory
+        .write(
+            GuestAddress(0x0030_0000),
+            &[0xb8, 0x00, 0x00, 0x00, 0x00, 0xc2, 0x04, 0x00],
+        )
+        .unwrap();
+    let (_thread, worker_id) = {
+        let mut context = test_host_context(&mut runtime);
+        context
+            .create_guest_thread(GuestAddress(0x0030_0000), 0, 0, 0)
+            .unwrap()
+    };
+
+    runtime
+        .memory
+        .map_range(GuestAddress(0x0031_0000), 0x1000, Permissions::ALL)
+        .unwrap();
+    runtime
+        .memory
+        .write(GuestAddress(0x0031_0000), &[0xf4])
+        .unwrap();
+    let wait_frame = GUEST_STACK_TOP - 12;
+    runtime.cpu.state.registers.esp = wait_frame;
+    runtime
+        .memory
+        .write_u32(GuestAddress(wait_frame), 0x0031_0000)
+        .unwrap();
+
+    {
+        let mut context = test_host_context(&mut runtime);
+        context
+            .park_wait_and_schedule(&[event], true, 8)
+            .expect("main should park on the unsignaled event");
+    }
+    assert_eq!(runtime.threads.current_id(), worker_id);
+
+    // While the worker is current, signal the event main is waiting on.
+    {
+        let mut context = test_host_context(&mut runtime);
+        context.set_event_state(event, true).unwrap();
+    }
+    assert!(
+        runtime
+            .threads
+            .waiting_threads()
+            .iter()
+            .all(|(id, _)| *id != GUEST_THREAD_ID),
+        "main should have been marked Ready after SetEvent"
+    );
+
+    let outcome = runtime
+        .run(RunLimits {
+            max_instructions: 32,
+        })
+        .expect("worker exit should resume main");
+    assert_eq!(outcome, RunOutcome::Halted);
+    assert_eq!(runtime.threads.current_id(), GUEST_THREAD_ID);
+    assert_eq!(runtime.cpu.state.registers.eax, 0);
+}
+
+fn test_host_context(runtime: &mut Runtime) -> RuntimeHostContext<'_> {
+    RuntimeHostContext {
+        cpu: &mut runtime.cpu,
+        memory: &mut runtime.memory,
+        exit_code: &mut runtime.exit_code,
+        stdcall_cleanup: 0,
+        started_at: runtime.started_at,
+        heaps: &mut runtime.heaps,
+        global_allocations: &mut runtime.global_allocations,
+        tls_slots: &mut runtime.tls_slots,
+        unhandled_exception_filter: &mut runtime.unhandled_exception_filter,
+        mutexes: &mut runtime.mutexes,
+        events: &mut runtime.events,
+        tokens: &mut runtime.tokens,
+        threads: &mut runtime.threads,
+        scheduler_switched: false,
+        com_initialization_count: &mut runtime.com_initialization_count,
+        cursor_display_count: &mut runtime.cursor_display_count,
+        focused_window: &mut runtime.focused_window,
+        window_class_longs: &mut runtime.window_class_longs,
+        icons: &mut runtime.icons,
+        next_icon_handle: &mut runtime.next_icon_handle,
+        window_classes: &mut runtime.window_classes,
+        next_window_class_atom: &mut runtime.next_window_class_atom,
+        window_regions: &mut runtime.window_regions,
+        windows: &mut runtime.windows,
+        window_titles: &mut runtime.window_titles,
+        visible_windows: &mut runtime.visible_windows,
+        window_placements: &mut runtime.window_placements,
+        disabled_windows: &mut runtime.disabled_windows,
+        thread_messages: &mut runtime.thread_messages,
+        primary_display_size: &mut runtime.primary_display_size,
+        menus: &mut runtime.menus,
+        next_menu_handle: &mut runtime.next_menu_handle,
+        menu_children: &mut runtime.menu_children,
+        cursor_position: &mut runtime.cursor_position,
+        window_menus: &mut runtime.window_menus,
+        clipboard_open: &mut runtime.clipboard_open,
+        clipboard_data: &mut runtime.clipboard_data,
+        window_longs: &mut runtime.window_longs,
+        invalidated_windows: &mut runtime.invalidated_windows,
+        window_dcs: &mut runtime.window_dcs,
+        next_window_dc: &mut runtime.next_window_dc,
+        keyboard_state: &mut runtime.keyboard_state,
+        memory_dcs: &mut runtime.memory_dcs,
+        next_memory_dc: &mut runtime.next_memory_dc,
+        selected_gdi_objects: &mut runtime.selected_gdi_objects,
+        gdi_objects: &mut runtime.gdi_objects,
+        next_gdi_object: &mut runtime.next_gdi_object,
+        gdi_dc_attributes: &mut runtime.gdi_dc_attributes,
+        window_frames: &mut runtime.window_frames,
+        graphics: &mut runtime.graphics,
+        next_window_handle: &mut runtime.next_window_handle,
+        image_base: runtime.image_base,
+        resource_directory: runtime.resource_directory,
+        virtual_memory: &mut runtime.virtual_memory,
+        api_registry: &runtime.api_registry,
+        import_thunks: &mut runtime.import_thunks,
+        host_modules: &runtime.host_modules,
+        command_line_ansi: runtime.command_line_ansi,
+        command_line_utf16: runtime.command_line_utf16,
+        process_parameters: runtime.process_parameters,
+        module_path: &runtime.module_path,
+        last_error: &mut runtime.last_error,
+        error_mode: &mut runtime.error_mode,
+        process_io: &mut runtime.process_io,
+        guest_stdout: &mut runtime.guest_stdout,
+        guest_stderr: &mut runtime.guest_stderr,
+        standard_handles: &mut runtime.standard_handles,
+        environment: &mut runtime.environment,
+        current_directory: &mut runtime.current_directory,
+        environment_block_ansi: &mut runtime.environment_block_ansi,
+        environment_block_utf16: &mut runtime.environment_block_utf16,
+        guest_callbacks: VecDeque::new(),
+        suspended_host_calls: &mut runtime.suspended_host_calls,
+        guest_callback_targets: &mut runtime.guest_callback_targets,
+        capture_callback_return: false,
+        raised_exception: None,
+    }
+}
+
 fn image_with_one_import() -> Vec<u8> {
     let mut image = vec![0_u8; 0x400];
     image[0..2].copy_from_slice(&0x5a4d_u16.to_le_bytes());

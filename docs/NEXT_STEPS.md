@@ -123,23 +123,29 @@ COMCTL32 #17 and DSOUND #1 imports correctly. The child crosses
 `CreateWindowExA` and reaches real resource keys such as `W0/CGS100`; the
 current executed frontier is PNG `gAMA` processing in image initialization.
 
-Continue the observed CPU/resource path until `Direct3DCreate9` actually
-executes. Then build only the COM methods the target calls over `vnrt-gfx`; the
-wgpu backend already creates and uploads real Host GPU textures. `vnrt-media`
-also provides bounded common-format decoding to RGBA8/f32 PCM, so those COM
-frontends do not need codec-specific implementations. Finally attach the
-modeled User32 window and presented frame to a native SDL3 window.
+Resource workers, cooperative waits, ShowWindow, and the initial DC probe now
+run. The live blocker is a null execute (`0xC0000005` at address 0) right after
+`GetDC` / `SetStretchBltMode` / `logprint` / `ReleaseDC`—before any
+`Direct3DCreate9` call. Diagnose that call site (stack/IAT/decoded pointer),
+then continue until `Direct3DCreate9` executes. Build only the COM methods the
+target calls over `vnrt-gfx`; the wgpu backend and `vnrt-media` decoders are
+already available. Finally attach the modeled User32 window and presented frame
+to a native SDL3 window.
 
 ## Following target milestone: complete target and first real window
 
-The import census has exposed thread and file-mapping APIs. Their current
-facades distinguish export availability from runtime support, but real calls
-must gain proper object lifetime and Guest scheduling semantics.
+Cooperative Guest threading for the first-frame path is in place: each thread
+owns CPU/stack/TEB/TLS state, `CreateThread`/`ResumeThread` register workers,
+blocking `WaitFor*` parks the current Guest context and schedules a Ready
+worker, and `SetEvent`/`ExitThread` wake waiters without Host-native threads.
+MMX coverage was extended for the post-wait pixel path.
 
-1. Implement the target-observed Direct3D 9 creation and presentation path.
-2. Implement cooperative Guest thread contexts if `CreateThread` is actually
-   invoked, including stacks, TLS, suspend counts, exit codes, and waits.
-3. Attach the already-modeled `CreateWindowExA` window to the first SDL3 native
+1. Resolve the null-execute after the DC/logprint probe (or harden SEH so the
+   original AV is the reported frontier without nested faults).
+2. Implement the target-observed Direct3D 9 creation and presentation path.
+3. Extend cooperative scheduling only as the target demands it (finite wait
+   timeouts, file-mapping waitables, broader TLS template copy).
+4. Attach the already-modeled `CreateWindowExA` window to the first SDL3 native
    window once the target has a presentable frame.
 
 ## Following low-level milestones

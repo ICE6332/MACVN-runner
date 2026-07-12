@@ -145,5 +145,31 @@ select a real GPU, create an RGBA render-target texture, upload pixels, and
 destroy it. D3D Guest interfaces will remain thin ABI/state adapters over this
 shared backend, allowing later D3D8/D3D11 frontends to reuse Metal/Vulkan/D3D12
 resource ownership. No native SDL3 window has been created yet.
+
+After multi-billion-instruction resource initialization, the dynamic path
+reaches `SetEvent` followed by `WaitForSingleObject(..., INFINITE)` over paired
+event tables. VNRT now models this with cooperative Guest threads rather than
+Host OS threads: workers get their own stack/TEB/TLS, blocking waits switch to
+a Ready context, and completion events switch back.
+
+Observed post-scheduler startup path (release, ~5B steps / ~3 minutes wall):
+
+1. `CreateThread` ×2 + `ResumeThread` for resource workers.
+2. Event kick/wait pairs complete through cooperative switching.
+3. Pixel/MMX conversion (`PXOR`, unpack/pack, saturating adds, shifts, …).
+4. Window placement (`MoveWindow` / `SetWindowPos`) and `ShowWindow`.
+5. `GetDC` → `SetStretchBltMode` → optional `logprint!Test` → `ReleaseDC`.
+
+The current dynamic frontier is an **execute access violation at address 0**
+immediately after that DC probe sequence (status `0xC0000005`). Guest SEH runs
+two frames, reaches `UnhandledExceptionFilter`, then a nested fault at EIP
+`0x6` while dispatch is still active. No `Direct3DCreate9` host call has been
+observed yet; D3D creation remains the documented next product milestone once
+this null call site is explained (missing export, bad decoded function pointer,
+or incomplete Guest state after the DC probe).
+
+`DecodePointer(NULL)` now returns NULL (Encode still cookie-xors null to a
+non-null token), matching native CRT expectations for empty handler slots.
+
 The HD executable remains useful as a comparison path but is not the primary
 target.

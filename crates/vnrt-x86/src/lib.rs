@@ -976,7 +976,61 @@ impl Interpreter {
             }
             Mnemonic::Movd => self.execute_mmx_movd(memory, instruction)?,
             Mnemonic::Movq => self.execute_mmx_movq(memory, instruction)?,
-            Mnemonic::Punpckldq => self.execute_mmx_punpckldq(memory, instruction)?,
+            Mnemonic::Pxor => self.execute_mmx_bitwise(memory, instruction, |a, b| a ^ b)?,
+            Mnemonic::Pand => self.execute_mmx_bitwise(memory, instruction, |a, b| a & b)?,
+            Mnemonic::Por => self.execute_mmx_bitwise(memory, instruction, |a, b| a | b)?,
+            Mnemonic::Pandn => self.execute_mmx_bitwise(memory, instruction, |a, b| (!a) & b)?,
+            Mnemonic::Punpcklbw => self.execute_mmx_punpck(memory, instruction, PunpckKind::Lbw)?,
+            Mnemonic::Punpckhbw => self.execute_mmx_punpck(memory, instruction, PunpckKind::Hbw)?,
+            Mnemonic::Punpcklwd => self.execute_mmx_punpck(memory, instruction, PunpckKind::Lwd)?,
+            Mnemonic::Punpckhwd => self.execute_mmx_punpck(memory, instruction, PunpckKind::Hwd)?,
+            Mnemonic::Punpckldq => self.execute_mmx_punpck(memory, instruction, PunpckKind::Ldq)?,
+            Mnemonic::Punpckhdq => self.execute_mmx_punpck(memory, instruction, PunpckKind::Hdq)?,
+            Mnemonic::Packuswb => self.execute_mmx_packuswb(memory, instruction)?,
+            Mnemonic::Packssdw => self.execute_mmx_packssdw(memory, instruction)?,
+            Mnemonic::Psrlw => self.execute_mmx_shift_words(memory, instruction, ShiftDir::Right)?,
+            Mnemonic::Psllw => self.execute_mmx_shift_words(memory, instruction, ShiftDir::Left)?,
+            Mnemonic::Psrld => self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Right)?,
+            Mnemonic::Pslld => self.execute_mmx_shift_dwords(memory, instruction, ShiftDir::Left)?,
+            Mnemonic::Psrlq => self.execute_mmx_shift_qword(memory, instruction, ShiftDir::Right)?,
+            Mnemonic::Psllq => self.execute_mmx_shift_qword(memory, instruction, ShiftDir::Left)?,
+            Mnemonic::Paddw => self.execute_mmx_word_arith(memory, instruction, WordArith::Add)?,
+            Mnemonic::Psubw => self.execute_mmx_word_arith(memory, instruction, WordArith::Sub)?,
+            Mnemonic::Pmullw => self.execute_mmx_word_arith(memory, instruction, WordArith::MulLow)?,
+            Mnemonic::Paddsw => {
+                self.execute_mmx_word_arith(memory, instruction, WordArith::AddSatSigned)?
+            }
+            Mnemonic::Psubsw => {
+                self.execute_mmx_word_arith(memory, instruction, WordArith::SubSatSigned)?
+            }
+            Mnemonic::Paddusw => {
+                self.execute_mmx_word_arith(memory, instruction, WordArith::AddSatUnsigned)?
+            }
+            Mnemonic::Psubusw => {
+                self.execute_mmx_word_arith(memory, instruction, WordArith::SubSatUnsigned)?
+            }
+            Mnemonic::Paddb => self.execute_mmx_byte_arith(memory, instruction, ByteArith::Add)?,
+            Mnemonic::Psubb => self.execute_mmx_byte_arith(memory, instruction, ByteArith::Sub)?,
+            Mnemonic::Paddusb => {
+                self.execute_mmx_byte_arith(memory, instruction, ByteArith::AddSatUnsigned)?
+            }
+            Mnemonic::Psubusb => {
+                self.execute_mmx_byte_arith(memory, instruction, ByteArith::SubSatUnsigned)?
+            }
+            Mnemonic::Paddsb => {
+                self.execute_mmx_byte_arith(memory, instruction, ByteArith::AddSatSigned)?
+            }
+            Mnemonic::Psubsb => {
+                self.execute_mmx_byte_arith(memory, instruction, ByteArith::SubSatSigned)?
+            }
+            Mnemonic::Paddd => self.execute_mmx_dword_arith(memory, instruction, true)?,
+            Mnemonic::Psubd => self.execute_mmx_dword_arith(memory, instruction, false)?,
+            Mnemonic::Pcmpeqb => {
+                self.execute_mmx_compare_bytes(memory, instruction, |a, b| a == b)?
+            }
+            Mnemonic::Pcmpeqw => {
+                self.execute_mmx_compare_words(memory, instruction, |a, b| a == b)?
+            }
             Mnemonic::Emms => self.state.registers.eip = next_ip,
             Mnemonic::Cld => {
                 self.state.registers.eflags &= !FLAG_DF;
@@ -2306,21 +2360,335 @@ impl Interpreter {
         Ok(())
     }
 
-    fn execute_mmx_punpckldq(
+    fn execute_mmx_bitwise(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        op: fn(u64, u64) -> u64,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX bitwise destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        self.state.mmx_registers[destination] = op(self.state.mmx_registers[destination], source);
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_punpck(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        kind: PunpckKind,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX unpack destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        self.state.mmx_registers[destination] = match kind {
+            PunpckKind::Lbw => unpack_interleave_bytes(dest, source, true),
+            PunpckKind::Hbw => unpack_interleave_bytes(dest, source, false),
+            PunpckKind::Lwd => unpack_interleave_words(dest, source, true),
+            PunpckKind::Hwd => unpack_interleave_words(dest, source, false),
+            PunpckKind::Ldq => {
+                let low = dest as u32;
+                u64::from(low) | (source & 0xffff_ffff) << 32
+            }
+            PunpckKind::Hdq => {
+                let high = (dest >> 32) as u32;
+                u64::from(high) | (source & 0xffff_ffff_0000_0000)
+            }
+        };
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_packuswb(
         &mut self,
         memory: &GuestMemory,
         instruction: &Instruction,
     ) -> Result<(), CpuError> {
-        if instruction.code() != Code::Punpckldq_mm_mmm32 {
-            return Err(unsupported_operand(instruction, "non-MMX PUNPCKLDQ form"));
-        }
         let destination = mmx_index(instruction.op_register(0))
-            .ok_or_else(|| unsupported_operand(instruction, "PUNPCKLDQ destination"))?;
+            .ok_or_else(|| unsupported_operand(instruction, "PACKUSWB destination"))?;
         let source = self.read_mmx_or_memory(memory, instruction, 1)?;
-        let low = self.state.mmx_registers[destination] as u32;
-        self.state.mmx_registers[destination] = u64::from(low) | (source & 0xffff_ffff) << 32;
+        let dest = self.state.mmx_registers[destination];
+        let mut bytes = [0_u8; 8];
+        for (index, value) in [
+            dest as u16,
+            (dest >> 16) as u16,
+            (dest >> 32) as u16,
+            (dest >> 48) as u16,
+            source as u16,
+            (source >> 16) as u16,
+            (source >> 32) as u16,
+            (source >> 48) as u16,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes[index] = saturate_signed_word_to_byte(value);
+        }
+        self.state.mmx_registers[destination] = u64::from_le_bytes(bytes);
         self.state.registers.eip = instruction.next_ip32();
         Ok(())
+    }
+
+    fn execute_mmx_packssdw(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "PACKSSDW destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let words = [
+            saturate_signed_dword_to_word(dest as u32),
+            saturate_signed_dword_to_word((dest >> 32) as u32),
+            saturate_signed_dword_to_word(source as u32),
+            saturate_signed_dword_to_word((source >> 32) as u32),
+        ];
+        self.state.mmx_registers[destination] = u64::from(words[0])
+            | u64::from(words[1]) << 16
+            | u64::from(words[2]) << 32
+            | u64::from(words[3]) << 48;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_shift_words(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        direction: ShiftDir,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX word shift destination"))?;
+        let count = self.read_mmx_shift_count(memory, instruction)?;
+        let mut value = self.state.mmx_registers[destination];
+        if count >= 16 {
+            value = 0;
+        } else if count > 0 {
+            let mut words = [0_u16; 4];
+            for (index, word) in words.iter_mut().enumerate() {
+                let raw = (value >> (16 * index)) as u16;
+                *word = match direction {
+                    ShiftDir::Left => raw << count,
+                    ShiftDir::Right => raw >> count,
+                };
+            }
+            value = u64::from(words[0])
+                | u64::from(words[1]) << 16
+                | u64::from(words[2]) << 32
+                | u64::from(words[3]) << 48;
+        }
+        self.state.mmx_registers[destination] = value;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_shift_dwords(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        direction: ShiftDir,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX dword shift destination"))?;
+        let count = self.read_mmx_shift_count(memory, instruction)?;
+        let mut value = self.state.mmx_registers[destination];
+        if count >= 32 {
+            value = 0;
+        } else if count > 0 {
+            let low = value as u32;
+            let high = (value >> 32) as u32;
+            let (low, high) = match direction {
+                ShiftDir::Left => (low << count, high << count),
+                ShiftDir::Right => (low >> count, high >> count),
+            };
+            value = u64::from(low) | u64::from(high) << 32;
+        }
+        self.state.mmx_registers[destination] = value;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_shift_qword(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        direction: ShiftDir,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX qword shift destination"))?;
+        let count = self.read_mmx_shift_count(memory, instruction)?;
+        let mut value = self.state.mmx_registers[destination];
+        if count >= 64 {
+            value = 0;
+        } else if count > 0 {
+            value = match direction {
+                ShiftDir::Left => value << count,
+                ShiftDir::Right => value >> count,
+            };
+        }
+        self.state.mmx_registers[destination] = value;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_word_arith(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        kind: WordArith,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX word arith destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let mut words = [0_u16; 4];
+        for (index, word) in words.iter_mut().enumerate() {
+            let left = (dest >> (16 * index)) as u16;
+            let right = (source >> (16 * index)) as u16;
+            *word = match kind {
+                WordArith::Add => left.wrapping_add(right),
+                WordArith::Sub => left.wrapping_sub(right),
+                WordArith::MulLow => left.wrapping_mul(right),
+                WordArith::AddSatSigned => {
+                    saturate_i16((left as i16) as i32 + (right as i16) as i32) as u16
+                }
+                WordArith::SubSatSigned => {
+                    saturate_i16((left as i16) as i32 - (right as i16) as i32) as u16
+                }
+                WordArith::AddSatUnsigned => {
+                    let sum = u32::from(left) + u32::from(right);
+                    if sum > 0xffff { 0xffff } else { sum as u16 }
+                }
+                WordArith::SubSatUnsigned => left.saturating_sub(right),
+            };
+        }
+        self.state.mmx_registers[destination] = u64::from(words[0])
+            | u64::from(words[1]) << 16
+            | u64::from(words[2]) << 32
+            | u64::from(words[3]) << 48;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_byte_arith(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        kind: ByteArith,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX byte arith destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let mut bytes = [0_u8; 8];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let left = (dest >> (8 * index)) as u8;
+            let right = (source >> (8 * index)) as u8;
+            *byte = match kind {
+                ByteArith::Add => left.wrapping_add(right),
+                ByteArith::Sub => left.wrapping_sub(right),
+                ByteArith::AddSatUnsigned => left.saturating_add(right),
+                ByteArith::SubSatUnsigned => left.saturating_sub(right),
+                ByteArith::AddSatSigned => {
+                    saturate_i8(i16::from(left as i8) + i16::from(right as i8)) as u8
+                }
+                ByteArith::SubSatSigned => {
+                    saturate_i8(i16::from(left as i8) - i16::from(right as i8)) as u8
+                }
+            };
+        }
+        self.state.mmx_registers[destination] = u64::from_le_bytes(bytes);
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_dword_arith(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        add: bool,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX dword arith destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let low = dest as u32;
+        let high = (dest >> 32) as u32;
+        let source_low = source as u32;
+        let source_high = (source >> 32) as u32;
+        let (low, high) = if add {
+            (low.wrapping_add(source_low), high.wrapping_add(source_high))
+        } else {
+            (low.wrapping_sub(source_low), high.wrapping_sub(source_high))
+        };
+        self.state.mmx_registers[destination] = u64::from(low) | u64::from(high) << 32;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_compare_bytes(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        predicate: fn(u8, u8) -> bool,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX compare destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let mut bytes = [0_u8; 8];
+        for index in 0..8 {
+            let left = (dest >> (8 * index)) as u8;
+            let right = (source >> (8 * index)) as u8;
+            bytes[index] = if predicate(left, right) { 0xff } else { 0 };
+        }
+        self.state.mmx_registers[destination] = u64::from_le_bytes(bytes);
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_mmx_compare_words(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+        predicate: fn(u16, u16) -> bool,
+    ) -> Result<(), CpuError> {
+        let destination = mmx_index(instruction.op_register(0))
+            .ok_or_else(|| unsupported_operand(instruction, "MMX compare destination"))?;
+        let source = self.read_mmx_or_memory(memory, instruction, 1)?;
+        let dest = self.state.mmx_registers[destination];
+        let mut words = [0_u16; 4];
+        for (index, word) in words.iter_mut().enumerate() {
+            let left = (dest >> (16 * index)) as u16;
+            let right = (source >> (16 * index)) as u16;
+            *word = if predicate(left, right) { 0xffff } else { 0 };
+        }
+        self.state.mmx_registers[destination] = u64::from(words[0])
+            | u64::from(words[1]) << 16
+            | u64::from(words[2]) << 32
+            | u64::from(words[3]) << 48;
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn read_mmx_shift_count(
+        &self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+    ) -> Result<u32, CpuError> {
+        match instruction.op_kind(1) {
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32 => {
+                Ok(u32::from(instruction.immediate8()))
+            }
+            OpKind::Register | OpKind::Memory => {
+                Ok((self.read_mmx_or_memory(memory, instruction, 1)? & 0xff) as u32)
+            }
+            _ => Err(unsupported_operand(instruction, "MMX shift count")),
+        }
     }
 
     fn read_mmx_or_memory(
@@ -2735,6 +3103,106 @@ fn register_width(register: Register) -> Option<OperandWidth> {
         | Register::EBP
         | Register::EIP => Some(OperandWidth::Dword),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PunpckKind {
+    Lbw,
+    Hbw,
+    Lwd,
+    Hwd,
+    Ldq,
+    Hdq,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShiftDir {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WordArith {
+    Add,
+    Sub,
+    MulLow,
+    AddSatSigned,
+    SubSatSigned,
+    AddSatUnsigned,
+    SubSatUnsigned,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ByteArith {
+    Add,
+    Sub,
+    AddSatUnsigned,
+    SubSatUnsigned,
+    AddSatSigned,
+    SubSatSigned,
+}
+
+fn unpack_interleave_bytes(dest: u64, source: u64, low: bool) -> u64 {
+    let shift = if low { 0 } else { 32 };
+    let mut result = 0_u64;
+    for index in 0..4 {
+        let d = ((dest >> (shift + 8 * index)) & 0xff) as u64;
+        let s = ((source >> (shift + 8 * index)) & 0xff) as u64;
+        result |= d << (16 * index);
+        result |= s << (16 * index + 8);
+    }
+    result
+}
+
+fn unpack_interleave_words(dest: u64, source: u64, low: bool) -> u64 {
+    let shift = if low { 0 } else { 32 };
+    let d0 = ((dest >> shift) & 0xffff) as u64;
+    let d1 = ((dest >> (shift + 16)) & 0xffff) as u64;
+    let s0 = ((source >> shift) & 0xffff) as u64;
+    let s1 = ((source >> (shift + 16)) & 0xffff) as u64;
+    d0 | (s0 << 16) | (d1 << 32) | (s1 << 48)
+}
+
+fn saturate_signed_word_to_byte(value: u16) -> u8 {
+    let signed = value as i16;
+    if signed < 0 {
+        0
+    } else if signed > 255 {
+        255
+    } else {
+        signed as u8
+    }
+}
+
+fn saturate_signed_dword_to_word(value: u32) -> u16 {
+    let signed = value as i32;
+    if signed < i32::from(i16::MIN) {
+        i16::MIN as u16
+    } else if signed > i32::from(i16::MAX) {
+        i16::MAX as u16
+    } else {
+        signed as u16
+    }
+}
+
+fn saturate_i16(value: i32) -> i16 {
+    if value < i32::from(i16::MIN) {
+        i16::MIN
+    } else if value > i32::from(i16::MAX) {
+        i16::MAX
+    } else {
+        value as i16
+    }
+}
+
+fn saturate_i8(value: i16) -> i8 {
+    if value < i16::from(i8::MIN) {
+        i8::MIN
+    } else if value > i16::from(i8::MAX) {
+        i8::MAX
+    } else {
+        value as i8
     }
 }
 
@@ -3229,6 +3697,28 @@ mod tests {
         }
         assert_eq!(memory.read_u32(GuestAddress(0x2000)).unwrap(), 50);
         assert_eq!(memory.read_u32(GuestAddress(0x2004)).unwrap(), 50);
+    }
+
+    #[test]
+    fn observed_mmx_zero_and_unpack_bytes_for_pixel_path() {
+        // mov eax,00FF00FFh; movd mm4,eax; punpckldq mm4,mm4;
+        // pxor mm7,mm7; movd mm0,eax; punpcklbw mm0,mm7
+        let code = [
+            0xb8, 0xff, 0x00, 0xff, 0x00, // mov eax,00FF00FFh
+            0x0f, 0x6e, 0xe0, // movd mm4,eax
+            0x0f, 0x62, 0xe4, // punpckldq mm4,mm4
+            0x0f, 0xef, 0xff, // pxor mm7,mm7
+            0x0f, 0x6e, 0xc0, // movd mm0,eax
+            0x0f, 0x60, 0xc7, // punpcklbw mm0,mm7
+        ];
+        let (mut cpu, mut memory) = machine(&code);
+        for _ in 0..6 {
+            cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        }
+        assert_eq!(cpu.state.mmx_registers[4], 0x00ff_00ff_00ff_00ff);
+        assert_eq!(cpu.state.mmx_registers[7], 0);
+        // low 4 bytes 0xFF,0x00,0xFF,0x00 expanded with zero high bytes
+        assert_eq!(cpu.state.mmx_registers[0], 0x0000_00ff_0000_00ff);
     }
 
     #[test]

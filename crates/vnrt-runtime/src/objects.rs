@@ -262,7 +262,11 @@ impl TlsSlotManager {
         }
     }
 
-    pub(super) fn allocate(&mut self, memory: &mut GuestMemory) -> Result<u32, Win32Error> {
+    pub(super) fn allocate(
+        &mut self,
+        memory: &mut GuestMemory,
+        tls_bases: &[u32],
+    ) -> Result<u32, Win32Error> {
         let index = self
             .allocated
             .iter()
@@ -270,36 +274,52 @@ impl TlsSlotManager {
             .ok_or(Win32Error::OutOfMemory)?;
         self.allocated[index] = true;
         let index = u32::try_from(index).map_err(|_| Win32Error::OutOfMemory)?;
-        memory
-            .write_u32(self.address(index)?, 0)
-            .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        for base in tls_bases {
+            memory
+                .write_u32(Self::slot_address(*base, index)?, 0)
+                .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        }
         Ok(index)
     }
 
-    pub(super) fn free(&mut self, memory: &mut GuestMemory, index: u32) -> Result<(), Win32Error> {
+    pub(super) fn free(
+        &mut self,
+        memory: &mut GuestMemory,
+        index: u32,
+        tls_bases: &[u32],
+    ) -> Result<(), Win32Error> {
         let host_index = self.validate_dynamic(index)?;
         self.allocated[host_index] = false;
-        memory
-            .write_u32(self.address(index)?, 0)
-            .map_err(|error| Win32Error::GuestMemory(error.to_string()))
+        for base in tls_bases {
+            memory
+                .write_u32(Self::slot_address(*base, index)?, 0)
+                .map_err(|error| Win32Error::GuestMemory(error.to_string()))?;
+        }
+        Ok(())
     }
 
-    pub(super) fn get(&self, memory: &GuestMemory, index: u32) -> Result<u32, Win32Error> {
+    pub(super) fn get(
+        &self,
+        memory: &GuestMemory,
+        tls_base: u32,
+        index: u32,
+    ) -> Result<u32, Win32Error> {
         self.validate(index)?;
         memory
-            .read_u32(self.address(index)?)
+            .read_u32(Self::slot_address(tls_base, index)?)
             .map_err(|error| Win32Error::GuestMemory(error.to_string()))
     }
 
     pub(super) fn set(
         &self,
         memory: &mut GuestMemory,
+        tls_base: u32,
         index: u32,
         value: u32,
     ) -> Result<(), Win32Error> {
         self.validate(index)?;
         memory
-            .write_u32(self.address(index)?, value)
+            .write_u32(Self::slot_address(tls_base, index)?, value)
             .map_err(|error| Win32Error::GuestMemory(error.to_string()))
     }
 
@@ -319,10 +339,10 @@ impl TlsSlotManager {
         Ok(index)
     }
 
-    pub(super) fn address(&self, index: u32) -> Result<GuestAddress, Win32Error> {
+    pub(super) fn slot_address(tls_base: u32, index: u32) -> Result<GuestAddress, Win32Error> {
         index
             .checked_mul(4)
-            .and_then(|offset| GUEST_TLS_BASE.checked_add(offset))
+            .and_then(|offset| tls_base.checked_add(offset))
             .map(GuestAddress)
             .ok_or(Win32Error::InvalidArgument("TLS slot address overflow"))
     }

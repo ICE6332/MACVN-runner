@@ -36,10 +36,13 @@ impl Runtime {
         &mut self,
         exception: CpuException,
     ) -> Result<(), RuntimeError> {
-        if self.pending_exception.is_some() {
-            return Err(RuntimeError::Unsupported(
-                "nested processor exception during SEH dispatch",
-            ));
+        if let Some(pending) = self.pending_exception.as_ref() {
+            return Err(RuntimeError::UnsupportedNestedException {
+                pending_code: pending.code,
+                pending_address: pending.address.0,
+                nested: format!("{exception:?}"),
+                eip: self.cpu.state.registers.eip,
+            });
         }
         let (code, address, information) = match exception {
             CpuException::Breakpoint { address, .. } => (EXCEPTION_BREAKPOINT, address, Vec::new()),

@@ -13,6 +13,9 @@ pub(super) struct RuntimeHostContext<'a> {
     pub(super) mutexes: &'a mut MutexManager,
     pub(super) events: &'a mut EventManager,
     pub(super) tokens: &'a mut TokenManager,
+    pub(super) threads: &'a mut ThreadManager,
+    /// Set when the cooperative scheduler replaced the active Guest context.
+    pub(super) scheduler_switched: bool,
     pub(super) com_initialization_count: &'a mut u32,
     pub(super) cursor_display_count: &'a mut i32,
     pub(super) focused_window: &'a mut u32,
@@ -877,19 +880,27 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn allocate_tls_index(&mut self) -> Result<u32, Win32Error> {
-        self.tls_slots.allocate(self.memory)
+        let bases = self.threads.tls_bases();
+        self.tls_slots.allocate(self.memory, &bases)
     }
 
     fn free_tls_index(&mut self, index: u32) -> Result<(), Win32Error> {
-        self.tls_slots.free(self.memory, index)
+        let bases = self.threads.tls_bases();
+        self.tls_slots.free(self.memory, index, &bases)
     }
 
     fn tls_value(&self, index: u32) -> Result<u32, Win32Error> {
-        self.tls_slots.get(self.memory, index)
+        self.tls_slots
+            .get(self.memory, self.threads.current_tls_base(), index)
     }
 
     fn set_tls_value(&mut self, index: u32, value: u32) -> Result<(), Win32Error> {
-        self.tls_slots.set(self.memory, index, value)
+        self.tls_slots.set(
+            self.memory,
+            self.threads.current_tls_base(),
+            index,
+            value,
+        )
     }
 
     fn replace_unhandled_exception_filter(&mut self, filter: u32) -> u32 {
@@ -1192,6 +1203,7 @@ impl HostCallContext for RuntimeHostContext<'_> {
                 .close(handle)
                 .or_else(|_| self.events.close(handle))
                 .or_else(|_| self.tokens.close(handle))
+                .or_else(|_| self.threads.close_handle(handle))
         }
     }
 
@@ -1220,7 +1232,9 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn release_mutex(&mut self, handle: Handle) -> Result<(), Win32Error> {
-        self.mutexes.release(handle, self.current_thread_id())
+        self.mutexes.release(handle, self.current_thread_id())?;
+        self.wake_waiters()?;
+        Ok(())
     }
 
     fn create_event(
@@ -1233,7 +1247,11 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn set_event_state(&mut self, handle: Handle, signaled: bool) -> Result<(), Win32Error> {
-        self.events.set_state(handle, signaled)
+        self.events.set_state(handle, signaled)?;
+        if signaled {
+            self.wake_waiters()?;
+        }
+        Ok(())
     }
 
     fn try_wait_for_objects(
@@ -1241,40 +1259,93 @@ impl HostCallContext for RuntimeHostContext<'_> {
         handles: &[Handle],
         wait_all: bool,
     ) -> Result<Option<u32>, Win32Error> {
-        if handles.is_empty() {
-            return Err(Win32Error::InvalidArgument("empty wait handle array"));
-        }
         let thread = self.current_thread_id();
-        let readiness = handles
-            .iter()
-            .map(|handle| {
-                self.events
-                    .is_signaled(*handle)
-                    .or_else(|| self.mutexes.is_available(*handle, thread))
-                    .ok_or(Win32Error::InvalidHandle(handle.0))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if wait_all {
-            if !readiness.iter().all(|ready| *ready) {
-                return Ok(None);
-            }
-            for handle in handles {
-                self.events
-                    .consume(*handle)
-                    .or_else(|| self.mutexes.acquire(*handle, thread));
-            }
-            Ok(Some(0))
-        } else if let Some(index) = readiness.iter().position(|ready| *ready) {
-            let handle = handles[index];
-            self.events
-                .consume(handle)
-                .or_else(|| self.mutexes.acquire(handle, thread));
-            u32::try_from(index)
-                .map(Some)
-                .map_err(|_| Win32Error::OutOfMemory)
-        } else {
-            Ok(None)
+        try_wait_objects(
+            self.events,
+            self.mutexes,
+            self.threads,
+            thread,
+            handles,
+            wait_all,
+            true,
+        )
+    }
+
+    fn park_wait_and_schedule(
+        &mut self,
+        handles: &[Handle],
+        wait_all: bool,
+        cleanup: u32,
+    ) -> Result<(), Win32Error> {
+        if !self.guest_callbacks.is_empty() || !self.suspended_host_calls.is_empty() {
+            return Err(Win32Error::Unsupported {
+                feature: "blocking wait during suspended Host callbacks",
+            });
         }
+        self.threads.park_current_wait(PendingWait {
+            handles: handles.to_vec(),
+            wait_all,
+            cleanup,
+        });
+        // Persist the waiting thread's CPU (still mid-host-call) before switching.
+        let next = self.threads.pick_runnable_other().ok_or(Win32Error::Unsupported {
+            feature: "blocking wait without a runnable Guest worker thread",
+        })?;
+        self.threads.switch_to(
+            next,
+            &mut self.cpu.state,
+            self.last_error,
+            self.memory,
+        )?;
+        self.scheduler_switched = true;
+        Ok(())
+    }
+
+    fn create_guest_thread(
+        &mut self,
+        start_address: GuestAddress,
+        parameter: u32,
+        stack_size: u32,
+        creation_flags: u32,
+    ) -> Result<(Handle, u32), Win32Error> {
+        self.threads.create_thread(
+            self.memory,
+            start_address,
+            parameter,
+            creation_flags,
+            stack_size,
+        )
+    }
+
+    fn resume_guest_thread(&mut self, handle: Handle) -> Result<u32, Win32Error> {
+        self.threads.resume(handle)
+    }
+
+    fn exit_guest_thread(&mut self, exit_code: u32) -> Result<(), Win32Error> {
+        if !self.guest_callbacks.is_empty() || !self.suspended_host_calls.is_empty() {
+            return Err(Win32Error::Unsupported {
+                feature: "ExitThread during suspended Host callbacks",
+            });
+        }
+        let is_main = self.threads.exit_current(exit_code);
+        // A terminated thread object becomes waitable.
+        self.wake_waiters()?;
+        if is_main {
+            *self.exit_code = Some(exit_code);
+            self.cpu.state.halted = true;
+            return Ok(());
+        }
+        let next = self.threads.pick_runnable_any().ok_or(Win32Error::Unsupported {
+            feature: "no runnable Guest thread after ExitThread",
+        })?;
+        self.threads.switch_to(
+            next,
+            &mut self.cpu.state,
+            self.last_error,
+            self.memory,
+        )?;
+        self.scheduler_switched = true;
+        Ok(())
     }
 
     fn find_first_file(&mut self, pattern: &str) -> Result<(Handle, FileEntry), Win32Error> {
@@ -1418,6 +1489,79 @@ impl HostCallContext for RuntimeHostContext<'_> {
     }
 
     fn current_thread_id(&self) -> u32 {
-        GUEST_THREAD_ID
+        self.threads.current_id()
+    }
+}
+
+impl RuntimeHostContext<'_> {
+    fn wake_waiters(&mut self) -> Result<(), Win32Error> {
+        let waiters = self.threads.waiting_threads();
+        let mut completions = Vec::new();
+        for (thread_id, wait) in waiters {
+            if let Some(result) = try_wait_objects(
+                self.events,
+                self.mutexes,
+                self.threads,
+                thread_id,
+                &wait.handles,
+                wait.wait_all,
+                true,
+            )? {
+                completions.push((thread_id, result, wait.cleanup));
+            }
+        }
+        for (thread_id, result, cleanup) in completions {
+            self.threads.complete_wait(thread_id, result, cleanup)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn try_wait_objects(
+    events: &mut EventManager,
+    mutexes: &mut MutexManager,
+    threads: &ThreadManager,
+    thread_id: u32,
+    handles: &[Handle],
+    wait_all: bool,
+    consume: bool,
+) -> Result<Option<u32>, Win32Error> {
+    if handles.is_empty() {
+        return Err(Win32Error::InvalidArgument("empty wait handle array"));
+    }
+    let readiness = handles
+        .iter()
+        .map(|handle| {
+            events
+                .is_signaled(*handle)
+                .or_else(|| mutexes.is_available(*handle, thread_id))
+                .or_else(|| threads.thread_is_signaled(*handle))
+                .ok_or(Win32Error::InvalidHandle(handle.0))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if wait_all {
+        if !readiness.iter().all(|ready| *ready) {
+            return Ok(None);
+        }
+        if consume {
+            for handle in handles {
+                let _ = events
+                    .consume(*handle)
+                    .or_else(|| mutexes.acquire(*handle, thread_id));
+            }
+        }
+        Ok(Some(0))
+    } else if let Some(index) = readiness.iter().position(|ready| *ready) {
+        if consume {
+            let handle = handles[index];
+            let _ = events
+                .consume(handle)
+                .or_else(|| mutexes.acquire(handle, thread_id));
+        }
+        u32::try_from(index)
+            .map(Some)
+            .map_err(|_| Win32Error::OutOfMemory)
+    } else {
+        Ok(None)
     }
 }

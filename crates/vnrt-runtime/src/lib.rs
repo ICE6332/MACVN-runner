@@ -6,6 +6,7 @@ mod host_context;
 mod loader;
 mod objects;
 mod process;
+mod threads;
 
 use allocation::*;
 use exceptions::*;
@@ -13,6 +14,7 @@ use host_context::*;
 use loader::*;
 use objects::*;
 use process::*;
+use threads::*;
 
 #[cfg(test)]
 mod tests;
@@ -213,6 +215,20 @@ pub enum RuntimeError {
     /// Known future runtime functionality.
     #[error("unsupported runtime feature: {0}")]
     Unsupported(&'static str),
+    /// A second processor fault occurred while a Guest SEH dispatch was active.
+    #[error(
+        "nested processor exception during SEH dispatch (pending {pending_code:#010x} at {pending_address:#010x}, eip={eip:#010x}): {nested}"
+    )]
+    UnsupportedNestedException {
+        /// Exception code of the still-active SEH dispatch.
+        pending_code: u32,
+        /// Fault address recorded for the still-active SEH dispatch.
+        pending_address: u32,
+        /// Debug representation of the nested processor exception.
+        nested: String,
+        /// Guest EIP when the nested fault was observed.
+        eip: u32,
+    },
     /// No Guest SEH frame accepted a synchronous processor exception.
     #[error("unhandled Guest exception {code:#010x} at {address:#010x}")]
     UnhandledGuestException {
@@ -243,6 +259,7 @@ pub struct Runtime {
     mutexes: MutexManager,
     events: EventManager,
     tokens: TokenManager,
+    threads: ThreadManager,
     com_initialization_count: u32,
     cursor_display_count: i32,
     focused_window: u32,
@@ -395,6 +412,7 @@ impl Runtime {
             .into_iter()
             .map(|(name, value)| (name.to_ascii_uppercase(), value))
             .collect();
+        let threads = ThreadManager::new_main(&cpu.state);
         Ok(Self {
             cpu,
             memory,
@@ -411,6 +429,7 @@ impl Runtime {
             mutexes: MutexManager::new(),
             events: EventManager::new(),
             tokens: TokenManager::new(),
+            threads,
             com_initialization_count: 0,
             cursor_display_count: 0,
             focused_window: 0,
@@ -609,6 +628,11 @@ impl Runtime {
                 consumed += 1;
                 continue;
             }
+            if self.cpu.state.registers.eip == THREAD_EXIT_RETURN_ADDRESS {
+                self.finish_thread_procedure_return()?;
+                consumed += 1;
+                continue;
+            }
             let resolver = ThunkResolver(&self.import_thunks);
             match self.cpu.run_batch(
                 &mut self.memory,
@@ -624,6 +648,8 @@ impl Runtime {
                         self.advance_host_callbacks()?;
                     } else if address.0 == EXCEPTION_HANDLER_RETURN_ADDRESS {
                         self.advance_exception_dispatch()?;
+                    } else if address.0 == THREAD_EXIT_RETURN_ADDRESS {
+                        self.finish_thread_procedure_return()?;
                     } else {
                         self.dispatch_host_call(address)?;
                     }
@@ -665,12 +691,22 @@ impl Runtime {
                 self.advance_exception_dispatch()?;
                 continue;
             }
+            if self.cpu.state.registers.eip == THREAD_EXIT_RETURN_ADDRESS {
+                self.finish_thread_procedure_return()?;
+                continue;
+            }
             let resolver = ThunkResolver(&self.import_thunks);
             match self.cpu.step(&mut self.memory, &resolver)? {
                 StepOutcome::Continue { instruction } => {
                     trace!(?instruction, "executed instruction");
                 }
-                StepOutcome::ExternalCall { address } => self.dispatch_host_call(address)?,
+                StepOutcome::ExternalCall { address } => {
+                    if address.0 == THREAD_EXIT_RETURN_ADDRESS {
+                        self.finish_thread_procedure_return()?;
+                    } else {
+                        self.dispatch_host_call(address)?;
+                    }
+                }
                 StepOutcome::Exception { exception } => {
                     self.dispatch_cpu_exception(exception)?;
                 }
@@ -684,6 +720,62 @@ impl Runtime {
             }
         }
         Err(RuntimeError::ExecutionLimit(limits.max_instructions))
+    }
+
+    fn finish_thread_procedure_return(&mut self) -> Result<(), RuntimeError> {
+        let exit_code = self.cpu.state.registers.eax;
+        self.exit_guest_thread_internal(exit_code)
+    }
+
+    fn exit_guest_thread_internal(&mut self, exit_code: u32) -> Result<(), RuntimeError> {
+        if !self.suspended_host_calls.is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "ExitThread with suspended Host callbacks",
+            ));
+        }
+        let is_main = self.threads.exit_current(exit_code);
+        self.wake_waiters_after_thread_exit()?;
+        if is_main {
+            self.exit_code = Some(exit_code);
+            self.cpu.state.halted = true;
+            return Ok(());
+        }
+        let next = self.threads.pick_runnable_any().ok_or(RuntimeError::Unsupported(
+            "no runnable Guest thread after ExitThread",
+        ))?;
+        self.threads.switch_to(
+            next,
+            &mut self.cpu.state,
+            &mut self.last_error,
+            &mut self.memory,
+        )?;
+        Ok(())
+    }
+
+    fn wake_waiters_after_thread_exit(&mut self) -> Result<(), RuntimeError> {
+        let waiters = self.threads.waiting_threads();
+        let mut completions = Vec::new();
+        for (thread_id, wait) in waiters {
+            if let Some(result) = try_wait_objects(
+                &mut self.events,
+                &mut self.mutexes,
+                &self.threads,
+                thread_id,
+                &wait.handles,
+                wait.wait_all,
+                true,
+            )
+            .map_err(RuntimeError::from)?
+            {
+                completions.push((thread_id, result, wait.cleanup));
+            }
+        }
+        for (thread_id, result, cleanup) in completions {
+            self.threads
+                .complete_wait(thread_id, result, cleanup)
+                .map_err(RuntimeError::from)?;
+        }
+        Ok(())
     }
 
     fn advance_tls_callbacks(&mut self) -> Result<(), RuntimeError> {
@@ -785,10 +877,11 @@ impl Runtime {
 
         // Guest code can access LastError directly through fs:[34h]. Refresh
         // the Host-side slot at every API boundary and publish API changes
-        // back into the TEB before returning to x86 execution.
+        // back into the current thread's TEB before returning to x86 execution.
+        let teb_base = self.threads.current_teb();
         self.last_error = self
             .memory
-            .read_u32(GuestAddress(GUEST_TEB_BASE + TEB_LAST_ERROR_OFFSET))?;
+            .read_u32(GuestAddress(teb_base + TEB_LAST_ERROR_OFFSET))?;
 
         let mut context = RuntimeHostContext {
             cpu: &mut self.cpu,
@@ -803,6 +896,8 @@ impl Runtime {
             mutexes: &mut self.mutexes,
             events: &mut self.events,
             tokens: &mut self.tokens,
+            threads: &mut self.threads,
+            scheduler_switched: false,
             com_initialization_count: &mut self.com_initialization_count,
             cursor_display_count: &mut self.cursor_display_count,
             focused_window: &mut self.focused_window,
@@ -867,11 +962,17 @@ impl Runtime {
             raised_exception: None,
         };
         let invocation = handler.invoke(&mut context);
+        let teb_base = context.threads.current_teb();
         context.memory.write_u32(
-            GuestAddress(GUEST_TEB_BASE + TEB_LAST_ERROR_OFFSET),
+            GuestAddress(teb_base + TEB_LAST_ERROR_OFFSET),
             *context.last_error,
         )?;
+        let scheduler_switched = context.scheduler_switched;
         invocation?;
+        if scheduler_switched {
+            // The cooperative scheduler already installed another Guest context.
+            return Ok(());
+        }
         if context.exit_code.is_none() {
             if context.guest_callbacks.is_empty() {
                 context.finish_host_return()?;
@@ -922,6 +1023,7 @@ impl ExternalTargetResolver for ThunkResolver<'_> {
                 TLS_CALLBACK_RETURN_ADDRESS
                     | HOST_CALLBACK_RETURN_ADDRESS
                     | EXCEPTION_HANDLER_RETURN_ADDRESS
+                    | THREAD_EXIT_RETURN_ADDRESS
             )
     }
 }
