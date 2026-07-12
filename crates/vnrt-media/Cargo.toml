@@ -1,0 +1,15 @@
+[package]
+name = "vnrt-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+image.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+vnrt-gfx = { path = "../vnrt-gfx" }
+
+[lints]
+workspace = true

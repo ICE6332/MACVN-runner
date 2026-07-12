@@ -9,6 +9,7 @@ This is not Wine and is not intended to run arbitrary Windows software.
 - PE32 loading, imports, TLS, TEB/PEB, memory, files, and callbacks work.
 - The runner covers a growing Kernel32/User32/GDI32/WinMM surface and can capture Guest DIB presentation as RGBA frames.
 - A backend-neutral graphics layer now owns real wgpu textures; wgpu selects Metal on macOS while leaving Vulkan, D3D12, and GLES available on other hosts.
+- A bounded Host media layer normalizes PNG/JPEG/BMP/GIF/WebP/TGA/TIFF/ICO/DDS to RGBA8 and WAV/OGG/MP3/FLAC/AAC/M4A/AIFF to interleaved f32 PCM.
 - The primary Chinese `euphoriaCN.exe` target now unpacks its child, opens the real YPF archives, creates its modeled main window, and enters real resource lookup.
 - Read-only archives stream from Host files, so the 1.6 GB `cg.ypf` is no longer copied into RAM. The current frontier is an x87 resource-initialization path; no Guest D3D method has executed yet.
 
@@ -37,6 +38,7 @@ cargo check --workspace --all-features
 - `crates/vnrt-runtime`: loader/runtime composition
 - `crates/vnrt-gfx`: backend-neutral GPU resources
 - `crates/vnrt-gfx-wgpu`: Metal/Vulkan/D3D12/GLES backend through wgpu
+- `crates/vnrt-media`: common image/audio decoding and texture upload
 - `crates/vnrt-x86`: x86 interpreter
 - `crates/vnrt-*32`: target-driven Win32 API surfaces
 - `docs/NEXT_STEPS.md`: roadmap

@@ -120,12 +120,14 @@ opens all 15 observed YPF archives through seekable Host streams rather than
 copying them into RAM. Fixed ordinal exports now resolve the target's
 COMCTL32 #17 and DSOUND #1 imports correctly. The child crosses
 `CreateWindowExA` and reaches real resource keys such as `W0/CGS100`; the
-current executed frontier is x87 resource initialization.
+current executed frontier is PNG `gAMA` processing in image initialization.
 
 Continue the observed CPU/resource path until `Direct3DCreate9` actually
 executes. Then build only the COM methods the target calls over `vnrt-gfx`; the
-wgpu backend already creates and uploads real Host GPU textures. Finally attach
-the modeled User32 window and presented frame to a native SDL3 window.
+wgpu backend already creates and uploads real Host GPU textures. `vnrt-media`
+also provides bounded common-format decoding to RGBA8/f32 PCM, so those COM
+frontends do not need codec-specific implementations. Finally attach the
+modeled User32 window and presented frame to a native SDL3 window.
 
 ## Following target milestone: complete target and first real window
 
