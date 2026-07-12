@@ -22,7 +22,16 @@ Requires Rust 1.97 or newer.
 ```bash
 cargo test --workspace
 cargo run -p vnrt-inspect -- path/to/game.exe
+cargo run -p vnrt-inspect -- path/to/game.exe --census
 cargo run -p vnrt-runner -- path/to/game.exe --max-instructions 1000000
+cargo run --profile frontier -p vnrt-runner -- path/to/game.exe \
+  --max-instructions 10000000000 --dump-first-frame first-frame.png
+```
+
+For repeated deep-target runs, use the optimized fast-link profile:
+
+```bash
+cargo run --profile frontier -p vnrt-runner -- path/to/game.exe --max-instructions 10000000000
 ```
 
 Enable the optional SDL3 dependency with:

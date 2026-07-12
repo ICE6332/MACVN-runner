@@ -75,7 +75,8 @@ amount of compatibility surface, rather than broad Windows coverage.
 - Execute compiler-emitted `SHR`, `SAR`, `IMUL`, `MUL`, `DIV`, `IDIV`, `CDQ`,
   `CWD`, and `NEG`, including explicit divide faults and arithmetic flags.
 - Execute `CLD`/`STD`, byte/word/dword `MOVS`, `STOS`, `LODS`, `CMPS`, and
-  `SCAS`; REP iterations remain individually bounded by the Runtime step limit.
+  `SCAS`; REP instructions execute in bounded 65,536-iteration chunks so large
+  image copies avoid per-byte decoder and dispatch overhead.
 - Consume and produce carry correctly for byte/word/dword `ADC` and `SBB`,
   including `CF`, `PF`, `AF`, `ZF`, `SF`, and `OF`.
 - Present a fixed Windows 10 22H2 Workstation identity (`10.0.19045`) through

@@ -124,10 +124,21 @@ The current executed path has crossed `CreateWindowExA` and reached real
 resource keys such as `W0/CGS100`. Newly observed `FSQRT`, x87 arithmetic,
 `SHLD`/`SHRD`, `JECXZ`, 64-bit `FISTP`, and implicit-`ST(0)` x87 memory
 arithmetic are implemented with focused tests. The latest run reaches PNG
-`gAMA` chunk processing from the real archives; `FDIV` and non-popping `FST`
-cover the latest executed gamma conversion. No Guest D3D method has executed
-yet; the immediate frontier remains image/resource initialization before
-`Direct3DCreate9`.
+`gAMA` chunk processing from the real archives. `FDIV`, non-popping `FST`, x87
+comparison/status transfer, stack exchange, and sign operations cover the
+latest executed image conversion. The engine now opens the concrete UI asset
+`cgsys\\wide_left.png`. No Guest D3D method has executed yet; the immediate
+frontier remains image/resource initialization before `Direct3DCreate9`.
+
+A whole-image instruction census now separates the finite target set from
+linked-library noise. Register `FLD`, control-word rounding, common x87
+constants, integer widths, and the `FYL2X`/`F2XM1`/`FSCALE` power sequence are
+covered. REP string operations execute in bounded chunks rather than paying
+decoder/dispatch overhead per byte. With those changes the dynamic path leaves
+PNG conversion and enters the engine's parallel resource workers. The current
+frontier is a real `SetEvent` followed by an infinite wait on a worker
+completion event: cooperative Guest thread scheduling is now the prerequisite
+before D3D device creation.
 
 The Host graphics substrate now uses wgpu 30 and has been verified locally to
 select a real GPU, create an RGBA render-target texture, upload pixels, and

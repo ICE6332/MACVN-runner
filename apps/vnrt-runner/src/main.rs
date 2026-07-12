@@ -23,6 +23,9 @@ struct Arguments {
     /// Safety limit for this intentionally incomplete interpreter.
     #[arg(long, default_value_t = 1_000)]
     max_instructions: u64,
+    /// Stop at the first Guest-presented frame and write it as PNG.
+    #[arg(long, value_name = "PNG")]
+    dump_first_frame: Option<PathBuf>,
 }
 
 fn main() -> Result<ExitCode> {
@@ -84,9 +87,14 @@ fn main() -> Result<ExitCode> {
     runtime.set_graphics_device(Box::new(graphics));
 
     info!(path = %arguments.path.display(), "guest image loaded");
-    let outcome = match runtime.run(RunLimits {
+    let limits = RunLimits {
         max_instructions: arguments.max_instructions,
-    }) {
+    };
+    let outcome = match if arguments.dump_first_frame.is_some() {
+        runtime.run_until_first_frame(limits)
+    } else {
+        runtime.run(limits)
+    } {
         Ok(outcome) => outcome,
         Err(runtime_error) => {
             let snapshot = runtime.diagnostic_snapshot();
@@ -112,6 +120,25 @@ fn main() -> Result<ExitCode> {
             return Err(runtime_error.into());
         }
     };
+    if let RunOutcome::FramePresented(window) = outcome {
+        let path = arguments
+            .dump_first_frame
+            .as_ref()
+            .context("frame stop requested without an output path")?;
+        let frame = runtime
+            .window_frame(window)
+            .context("presented window does not retain its frame")?;
+        image::save_buffer_with_format(
+            path,
+            &frame.rgba,
+            frame.width,
+            frame.height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .with_context(|| format!("failed to write {}", path.display()))?;
+        info!(window, path = %path.display(), "first Guest frame written");
+    }
     emit_guest_output(&runtime)?;
     if std::env::var_os("VNRT_TRACE_INSTRUCTIONS").is_some() {
         info!(
@@ -130,7 +157,7 @@ fn main() -> Result<ExitCode> {
     info!(?outcome, "guest stopped");
     Ok(match outcome {
         RunOutcome::Exited(code) => ExitCode::from(code.to_le_bytes()[0]),
-        RunOutcome::Halted => ExitCode::SUCCESS,
+        RunOutcome::Halted | RunOutcome::FramePresented(_) => ExitCode::SUCCESS,
     })
 }
 

@@ -1545,6 +1545,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "iced-x86",
+ "serde",
  "serde_json",
  "vnrt-pe",
 ]
@@ -1620,6 +1622,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "image",
  "tracing",
  "tracing-subscriber",
  "vnrt-advapi32",

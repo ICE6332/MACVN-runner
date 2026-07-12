@@ -163,6 +163,8 @@ pub enum RunOutcome {
     Exited(u32),
     /// The CPU was explicitly halted.
     Halted,
+    /// A Guest window presented its first normalized frame.
+    FramePresented(u32),
 }
 
 /// Machine state captured for actionable execution-failure diagnostics.
@@ -567,12 +569,27 @@ impl Runtime {
     /// Run until termination or an explicit execution limit.
     pub fn run(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
         if tracing::enabled!(target: "vnrt_runtime", tracing::Level::TRACE) {
-            return self.run_traced(limits);
+            return self.run_traced(limits, false);
         }
-        self.run_batched(limits)
+        self.run_batched(limits, false)
     }
 
-    fn run_batched(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
+    /// Run until the first Guest frame, termination, or the execution limit.
+    pub fn run_until_first_frame(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
+        if let Some(window) = self.window_frames.keys().copied().min() {
+            return Ok(RunOutcome::FramePresented(window));
+        }
+        if tracing::enabled!(target: "vnrt_runtime", tracing::Level::TRACE) {
+            return self.run_traced(limits, true);
+        }
+        self.run_batched(limits, true)
+    }
+
+    fn run_batched(
+        &mut self,
+        limits: RunLimits,
+        stop_at_first_frame: bool,
+    ) -> Result<RunOutcome, RuntimeError> {
         let mut consumed = 0;
         while consumed < limits.max_instructions {
             if self.tls_callbacks_active
@@ -620,11 +637,18 @@ impl Runtime {
             if let Some(code) = self.exit_code {
                 return Ok(RunOutcome::Exited(code));
             }
+            if stop_at_first_frame && let Some(window) = self.window_frames.keys().copied().min() {
+                return Ok(RunOutcome::FramePresented(window));
+            }
         }
         Err(RuntimeError::ExecutionLimit(limits.max_instructions))
     }
 
-    fn run_traced(&mut self, limits: RunLimits) -> Result<RunOutcome, RuntimeError> {
+    fn run_traced(
+        &mut self,
+        limits: RunLimits,
+        stop_at_first_frame: bool,
+    ) -> Result<RunOutcome, RuntimeError> {
         for step_index in 0..limits.max_instructions {
             trace!(step_index, eip = self.cpu.state.registers.eip, "guest step");
             if self.tls_callbacks_active
@@ -654,6 +678,9 @@ impl Runtime {
             }
             if let Some(code) = self.exit_code {
                 return Ok(RunOutcome::Exited(code));
+            }
+            if stop_at_first_frame && let Some(window) = self.window_frames.keys().copied().min() {
+                return Ok(RunOutcome::FramePresented(window));
             }
         }
         Err(RuntimeError::ExecutionLimit(limits.max_instructions))

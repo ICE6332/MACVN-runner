@@ -79,6 +79,7 @@ const LOGIC_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_ZF | FLAG_SF | FLAG_OF;
 const MAX_DECODE_CACHE_ENTRIES: usize = 1 << 20;
 const MAX_BLOCK_CACHE_ENTRIES: usize = 1 << 18;
 const MAX_BLOCK_INSTRUCTIONS: usize = 64;
+const MAX_REP_ITERATIONS_PER_STEP: u32 = 1 << 16;
 
 /// Architectural integer registers used by the initial interpreter.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -768,10 +769,45 @@ impl Interpreter {
                 self.state.x87_status_word &= !0x80ff;
                 self.state.registers.eip = next_ip;
             }
+            Mnemonic::Fnstsw | Mnemonic::Fstsw => {
+                if instruction.op_kind(0) == OpKind::Register {
+                    if instruction.op_register(0) != Register::AX {
+                        return Err(unsupported_operand(
+                            instruction,
+                            "x87 status destination is not AX",
+                        ));
+                    }
+                    self.state
+                        .registers
+                        .write(Register::AX, u32::from(self.state.x87_status_word));
+                } else {
+                    let address = self.effective_address(instruction, true)?;
+                    memory.write_u16(address, self.state.x87_status_word)?;
+                }
+                self.state.registers.eip = next_ip;
+            }
             Mnemonic::Fild => {
                 let address = self.effective_address(instruction, true)?;
-                let value = i32::from_le_bytes(memory.read_u32(address)?.to_le_bytes());
-                self.x87_push(f64::from(value));
+                let value = match instruction.memory_size() {
+                    MemorySize::Int16 => {
+                        f64::from(i16::from_le_bytes(memory.read_u16(address)?.to_le_bytes()))
+                    }
+                    MemorySize::Int32 => {
+                        f64::from(i32::from_le_bytes(memory.read_u32(address)?.to_le_bytes()))
+                    }
+                    MemorySize::Int64 => {
+                        let mut bytes = [0_u8; 8];
+                        memory.read(address, &mut bytes)?;
+                        i64::from_le_bytes(bytes) as f64
+                    }
+                    _ => {
+                        return Err(unsupported_operand(
+                            instruction,
+                            "unsupported FILD memory width",
+                        ));
+                    }
+                };
+                self.x87_push(value);
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Fadd
@@ -793,20 +829,105 @@ impl Interpreter {
                 self.x87_set(0, self.x87_get(0).sqrt());
                 self.state.registers.eip = next_ip;
             }
+            Mnemonic::Frndint => {
+                let rounded = self.x87_round(self.x87_get(0));
+                self.x87_set(0, rounded);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fyl2x => {
+                let result = self.x87_get(1) * self.x87_get(0).log2();
+                self.x87_set(1, result);
+                self.x87_pop();
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::F2xm1 => {
+                self.x87_set(0, self.x87_get(0).exp2() - 1.0);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fscale => {
+                let exponent = self.x87_get(1).trunc();
+                self.x87_set(0, self.x87_get(0) * exponent.exp2());
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fld1 => {
+                self.x87_push(1.0);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldz => {
+                self.x87_push(0.0);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldpi => {
+                self.x87_push(std::f64::consts::PI);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldl2e => {
+                self.x87_push(std::f64::consts::LOG2_E);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldl2t => {
+                self.x87_push(std::f64::consts::LOG2_10);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldlg2 => {
+                self.x87_push(std::f64::consts::LOG10_2);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fldln2 => {
+                self.x87_push(std::f64::consts::LN_2);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fabs => {
+                self.x87_set(0, self.x87_get(0).abs());
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fchs => {
+                self.x87_set(0, -self.x87_get(0));
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fxch => {
+                let exchange = (0..instruction.op_count())
+                    .filter(|operand| instruction.op_kind(*operand) == OpKind::Register)
+                    .filter_map(|operand| x87_register_index(instruction.op_register(operand)))
+                    .find(|index| *index != 0)
+                    .unwrap_or(0);
+                let top = self.x87_get(0);
+                let other = self.x87_get(exchange);
+                self.x87_set(0, other);
+                self.x87_set(exchange, top);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fcom
+            | Mnemonic::Fcomp
+            | Mnemonic::Fcompp
+            | Mnemonic::Fucom
+            | Mnemonic::Fucomp
+            | Mnemonic::Fucompp => {
+                self.execute_x87_compare(memory, instruction)?;
+                self.state.registers.eip = next_ip;
+            }
             Mnemonic::Fld => {
-                let address = self.effective_address(instruction, true)?;
-                let value = match instruction.memory_size() {
-                    MemorySize::Float32 => f64::from(f32::from_bits(memory.read_u32(address)?)),
-                    MemorySize::Float64 => {
-                        let mut bytes = [0_u8; 8];
-                        memory.read(address, &mut bytes)?;
-                        f64::from_bits(u64::from_le_bytes(bytes))
-                    }
-                    _ => {
-                        return Err(CpuError::UnsupportedOperand {
-                            address: instruction.ip32(),
-                            detail: "unsupported FLD memory width".to_owned(),
-                        });
+                let value = if instruction.op_kind(0) == OpKind::Register {
+                    let source =
+                        x87_register_index(instruction.op_register(0)).ok_or_else(|| {
+                            unsupported_operand(instruction, "FLD source is not ST(i)")
+                        })?;
+                    self.x87_get(source)
+                } else {
+                    let address = self.effective_address(instruction, true)?;
+                    match instruction.memory_size() {
+                        MemorySize::Float32 => f64::from(f32::from_bits(memory.read_u32(address)?)),
+                        MemorySize::Float64 => {
+                            let mut bytes = [0_u8; 8];
+                            memory.read(address, &mut bytes)?;
+                            f64::from_bits(u64::from_le_bytes(bytes))
+                        }
+                        _ => {
+                            return Err(unsupported_operand(
+                                instruction,
+                                "unsupported FLD memory width",
+                            ));
+                        }
                     }
                 };
                 self.x87_push(value);
@@ -845,61 +966,12 @@ impl Interpreter {
                 }
                 self.state.registers.eip = next_ip;
             }
-            Mnemonic::Fistp => {
-                let address = self.effective_address(instruction, true)?;
-                let value = self.x87_get(0);
-                let rounded = match (self.state.x87_control_word >> 10) & 3 {
-                    0 => value.round_ties_even(),
-                    1 => value.floor(),
-                    2 => value.ceil(),
-                    3 => value.trunc(),
-                    _ => unreachable!(),
-                };
-                match instruction.memory_size() {
-                    MemorySize::Int16 => {
-                        let integer = if rounded.is_finite()
-                            && rounded >= f64::from(i16::MIN)
-                            && rounded <= f64::from(i16::MAX)
-                        {
-                            rounded as i16
-                        } else {
-                            i16::MIN
-                        };
-                        memory.write_u16(address, integer as u16)?;
-                    }
-                    MemorySize::Int32 => {
-                        let integer = if rounded.is_finite()
-                            && rounded >= f64::from(i32::MIN)
-                            && rounded <= f64::from(i32::MAX)
-                        {
-                            rounded as i32
-                        } else {
-                            i32::MIN
-                        };
-                        memory.write_u32(address, integer as u32)?;
-                    }
-                    MemorySize::Int64 => {
-                        // i64::MAX is not exactly representable as f64; use an
-                        // exclusive 2^63 upper bound to preserve x87's integer
-                        // indefinite result on overflow.
-                        let integer = if rounded.is_finite()
-                            && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
-                                .contains(&rounded)
-                        {
-                            rounded as i64
-                        } else {
-                            i64::MIN
-                        };
-                        memory.write(address, &integer.to_le_bytes())?;
-                    }
-                    _ => {
-                        return Err(CpuError::UnsupportedOperand {
-                            address: instruction.ip32(),
-                            detail: "unsupported FISTP memory width".to_owned(),
-                        });
-                    }
+            Mnemonic::Fist | Mnemonic::Fistp | Mnemonic::Fisttp => {
+                let truncate = instruction.mnemonic() == Mnemonic::Fisttp;
+                self.execute_x87_integer_store(memory, instruction, truncate)?;
+                if instruction.mnemonic() != Mnemonic::Fist {
+                    self.x87_pop();
                 }
-                self.x87_pop();
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Movd => self.execute_mmx_movd(memory, instruction)?,
@@ -912,6 +984,17 @@ impl Interpreter {
             }
             Mnemonic::Std => {
                 self.state.registers.eflags |= FLAG_DF;
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Sahf => {
+                const SAHF_FLAGS: u32 = FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF | FLAG_CF;
+                let ah = (self.state.registers.eax >> 8) & 0xff;
+                self.state.registers.replace_flags(SAHF_FLAGS, ah);
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Lahf => {
+                let low_flags = self.state.registers.eflags & 0xd5 | 0x02;
+                self.state.registers.write(Register::AH, low_flags);
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Hlt => {
@@ -1153,6 +1236,76 @@ impl Interpreter {
             (self.state.x87_status_word & !0x3800) | (u16::from(self.state.x87_top) << 11);
     }
 
+    fn x87_round(&self, value: f64) -> f64 {
+        match (self.state.x87_control_word >> 10) & 3 {
+            0 => value.round_ties_even(),
+            1 => value.floor(),
+            2 => value.ceil(),
+            3 => value.trunc(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn execute_x87_integer_store(
+        &self,
+        memory: &mut GuestMemory,
+        instruction: &Instruction,
+        truncate: bool,
+    ) -> Result<(), CpuError> {
+        let address = self.effective_address(instruction, true)?;
+        let value = self.x87_get(0);
+        let rounded = if truncate {
+            value.trunc()
+        } else {
+            self.x87_round(value)
+        };
+        match instruction.memory_size() {
+            MemorySize::Int16 => {
+                let integer = if rounded.is_finite()
+                    && rounded >= f64::from(i16::MIN)
+                    && rounded <= f64::from(i16::MAX)
+                {
+                    rounded as i16
+                } else {
+                    i16::MIN
+                };
+                memory.write_u16(address, integer as u16)?;
+            }
+            MemorySize::Int32 => {
+                let integer = if rounded.is_finite()
+                    && rounded >= f64::from(i32::MIN)
+                    && rounded <= f64::from(i32::MAX)
+                {
+                    rounded as i32
+                } else {
+                    i32::MIN
+                };
+                memory.write_u32(address, integer as u32)?;
+            }
+            MemorySize::Int64 => {
+                // i64::MAX is not exactly representable as f64; use an
+                // exclusive 2^63 upper bound to preserve x87's integer
+                // indefinite result on overflow.
+                let integer = if rounded.is_finite()
+                    && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+                        .contains(&rounded)
+                {
+                    rounded as i64
+                } else {
+                    i64::MIN
+                };
+                memory.write(address, &integer.to_le_bytes())?;
+            }
+            _ => {
+                return Err(unsupported_operand(
+                    instruction,
+                    "unsupported x87 integer store width",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn execute_x87_binary(
         &mut self,
         memory: &GuestMemory,
@@ -1241,6 +1394,80 @@ impl Interpreter {
             self.x87_pop();
         }
         Ok(())
+    }
+
+    fn execute_x87_compare(
+        &mut self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+    ) -> Result<(), CpuError> {
+        const C0: u16 = 1 << 8;
+        const C2: u16 = 1 << 10;
+        const C3: u16 = 1 << 14;
+        let left = self.x87_get(0);
+        let right = self.read_x87_compare_source(memory, instruction)?;
+        let condition = if left.is_nan() || right.is_nan() {
+            C0 | C2 | C3
+        } else if left < right {
+            C0
+        } else if left == right {
+            C3
+        } else {
+            0
+        };
+        self.state.x87_status_word = (self.state.x87_status_word & !(C0 | C2 | C3)) | condition;
+        match instruction.mnemonic() {
+            Mnemonic::Fcomp | Mnemonic::Fucomp => self.x87_pop(),
+            Mnemonic::Fcompp | Mnemonic::Fucompp => {
+                self.x87_pop();
+                self.x87_pop();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn read_x87_compare_source(
+        &self,
+        memory: &GuestMemory,
+        instruction: &Instruction,
+    ) -> Result<f64, CpuError> {
+        let source_operand = if instruction.op_count() >= 2 {
+            1
+        } else if instruction.op_count() == 1 {
+            0
+        } else {
+            return Err(unsupported_operand(
+                instruction,
+                "missing x87 comparison source",
+            ));
+        };
+        match instruction.op_kind(source_operand) {
+            OpKind::Register => {
+                let index = x87_register_index(instruction.op_register(source_operand))
+                    .ok_or_else(|| unsupported_operand(instruction, "x87 source is not ST(i)"))?;
+                Ok(self.x87_get(index))
+            }
+            OpKind::Memory => {
+                let address = self.effective_address(instruction, true)?;
+                match instruction.memory_size() {
+                    MemorySize::Float32 => Ok(f64::from(f32::from_bits(memory.read_u32(address)?))),
+                    MemorySize::Float64 => {
+                        let mut bytes = [0_u8; 8];
+                        memory.read(address, &mut bytes)?;
+                        Ok(f64::from_bits(u64::from_le_bytes(bytes)))
+                    }
+                    _ => Err(unsupported_operand(
+                        instruction,
+                        "unsupported x87 comparison memory width",
+                    )),
+                }
+            }
+            _ => Err(unsupported_operand(
+                instruction,
+                "unsupported x87 comparison source",
+            )),
+        }
     }
 
     fn execute_binary(
@@ -1696,72 +1923,85 @@ impl Interpreter {
         let mnemonic = instruction.mnemonic();
         let width = string_width(mnemonic)
             .ok_or_else(|| unsupported_operand(instruction, "unsupported string width"))?;
-        let source = self.string_source_address(instruction)?;
-        let destination = GuestAddress(self.state.registers.edi);
-        match mnemonic {
-            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd => {
-                let value = read_memory_width(memory, source, width)?;
-                write_memory_width(memory, destination, value, width)?;
-                self.advance_string_source(width);
-                self.advance_string_destination(width);
+        let compare = matches!(
+            mnemonic,
+            Mnemonic::Cmpsb
+                | Mnemonic::Cmpsw
+                | Mnemonic::Cmpsd
+                | Mnemonic::Scasb
+                | Mnemonic::Scasw
+                | Mnemonic::Scasd
+        );
+        let iterations = if repeated {
+            self.state.registers.ecx.min(MAX_REP_ITERATIONS_PER_STEP)
+        } else {
+            1
+        };
+        let mut condition_allows_repeat = true;
+        for _ in 0..iterations {
+            let source = self.string_source_address(instruction)?;
+            let destination = GuestAddress(self.state.registers.edi);
+            match mnemonic {
+                Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd => {
+                    let value = read_memory_width(memory, source, width)?;
+                    write_memory_width(memory, destination, value, width)?;
+                    self.advance_string_source(width);
+                    self.advance_string_destination(width);
+                }
+                Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd => {
+                    let value = width.truncate(self.state.registers.eax);
+                    write_memory_width(memory, destination, value, width)?;
+                    self.advance_string_destination(width);
+                }
+                Mnemonic::Lodsb | Mnemonic::Lodsw | Mnemonic::Lodsd => {
+                    let value = read_memory_width(memory, source, width)?;
+                    self.state
+                        .registers
+                        .write(accumulator_register(width), value);
+                    self.advance_string_source(width);
+                }
+                Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd => {
+                    let left = read_memory_width(memory, source, width)?;
+                    let right = read_memory_width(memory, destination, width)?;
+                    let result = width.truncate(left.wrapping_sub(right));
+                    self.state
+                        .registers
+                        .replace_flags(ARITHMETIC_FLAGS, sub_flags(left, right, result, width));
+                    self.advance_string_source(width);
+                    self.advance_string_destination(width);
+                }
+                Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd => {
+                    let left = width.truncate(self.state.registers.eax);
+                    let right = read_memory_width(memory, destination, width)?;
+                    let result = width.truncate(left.wrapping_sub(right));
+                    self.state
+                        .registers
+                        .replace_flags(ARITHMETIC_FLAGS, sub_flags(left, right, result, width));
+                    self.advance_string_destination(width);
+                }
+                _ => {
+                    return Err(unsupported_operand(
+                        instruction,
+                        "unsupported string instruction",
+                    ));
+                }
             }
-            Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd => {
-                let value = width.truncate(self.state.registers.eax);
-                write_memory_width(memory, destination, value, width)?;
-                self.advance_string_destination(width);
+            if !repeated {
+                break;
             }
-            Mnemonic::Lodsb | Mnemonic::Lodsw | Mnemonic::Lodsd => {
-                let value = read_memory_width(memory, source, width)?;
-                self.state
-                    .registers
-                    .write(accumulator_register(width), value);
-                self.advance_string_source(width);
-            }
-            Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd => {
-                let left = read_memory_width(memory, source, width)?;
-                let right = read_memory_width(memory, destination, width)?;
-                let result = width.truncate(left.wrapping_sub(right));
-                self.state
-                    .registers
-                    .replace_flags(ARITHMETIC_FLAGS, sub_flags(left, right, result, width));
-                self.advance_string_source(width);
-                self.advance_string_destination(width);
-            }
-            Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd => {
-                let left = width.truncate(self.state.registers.eax);
-                let right = read_memory_width(memory, destination, width)?;
-                let result = width.truncate(left.wrapping_sub(right));
-                self.state
-                    .registers
-                    .replace_flags(ARITHMETIC_FLAGS, sub_flags(left, right, result, width));
-                self.advance_string_destination(width);
-            }
-            _ => {
-                return Err(unsupported_operand(
-                    instruction,
-                    "unsupported string instruction",
-                ));
-            }
-        }
-
-        if repeated {
             self.state.registers.ecx = self.state.registers.ecx.wrapping_sub(1);
-            let compare = matches!(
-                mnemonic,
-                Mnemonic::Cmpsb
-                    | Mnemonic::Cmpsw
-                    | Mnemonic::Cmpsd
-                    | Mnemonic::Scasb
-                    | Mnemonic::Scasw
-                    | Mnemonic::Scasd
-            );
-            let condition_allows_repeat = if !compare {
+            condition_allows_repeat = if !compare {
                 true
             } else if instruction.has_repne_prefix() {
                 !self.state.registers.flag(FLAG_ZF)
             } else {
                 self.state.registers.flag(FLAG_ZF)
             };
+            if self.state.registers.ecx == 0 || !condition_allows_repeat {
+                break;
+            }
+        }
+        if repeated {
             self.state.registers.eip = if self.state.registers.ecx != 0 && condition_allows_repeat {
                 instruction.ip32()
             } else {
@@ -2750,6 +2990,113 @@ mod tests {
     }
 
     #[test]
+    fn x87_compare_status_flows_through_fnstsw_and_sahf() {
+        // fcom qword ptr [2000h]; fnstsw ax; sahf; lahf
+        let (mut cpu, mut memory) =
+            machine(&[0xdc, 0x15, 0x00, 0x20, 0x00, 0x00, 0xdf, 0xe0, 0x9e, 0x9f]);
+        memory
+            .write(GuestAddress(0x2000), &2.0_f64.to_le_bytes())
+            .unwrap();
+        cpu.x87_push(1.0);
+        cpu.state.registers.eflags = FLAG_OF | FLAG_ZF | 0x2;
+
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_ne!(cpu.state.x87_status_word & (1 << 8), 0); // C0: less-than
+        assert_eq!(cpu.state.x87_status_word & ((1 << 10) | (1 << 14)), 0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_ne!(cpu.state.registers.eax & 0x0100, 0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert!(cpu.state.registers.flag(FLAG_CF));
+        assert!(!cpu.state.registers.flag(FLAG_ZF));
+        assert!(cpu.state.registers.flag(FLAG_OF));
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!((cpu.state.registers.eax >> 8) & 0xd5, FLAG_CF | FLAG_AF);
+    }
+
+    #[test]
+    fn x87_exchange_swaps_logical_stack_registers() {
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xc9]); // fxch st(1)
+        cpu.x87_push(10.0);
+        cpu.x87_push(20.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 10.0);
+        assert_eq!(cpu.x87_get(1), 20.0);
+    }
+
+    #[test]
+    fn x87_sign_operations_transform_stack_top() {
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xe1, 0xd9, 0xe0]); // fabs; fchs
+        cpu.x87_push(-3.5);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 3.5);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), -3.5);
+    }
+
+    #[test]
+    fn x87_register_load_duplicates_the_selected_stack_value() {
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xc1]); // fld st(1)
+        cpu.x87_push(10.0);
+        cpu.x87_push(20.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 10.0);
+        assert_eq!(cpu.x87_get(1), 20.0);
+        assert_eq!(cpu.x87_get(2), 10.0);
+    }
+
+    #[test]
+    fn x87_round_and_constant_loads_follow_the_control_word() {
+        // fld1; fldz; frndint
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xe8, 0xd9, 0xee, 0xd9, 0xfc]);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 1.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        cpu.x87_set(0, 2.5);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 2.0);
+
+        cpu.state.x87_control_word = (cpu.state.x87_control_word & !(3 << 10)) | (2 << 10);
+        cpu.x87_set(0, 2.1);
+        cpu.state.registers.eip = 0x1004;
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 3.0);
+    }
+
+    #[test]
+    fn x87_logarithm_and_exponential_sequence_computes_a_power() {
+        // fyl2x; fld st(0); frndint; fsub st(1),st; fxch st(1);
+        // fchs; f2xm1; fld1; faddp st(1),st; fscale; fstp st(1)
+        let (mut cpu, mut memory) = machine(&[
+            0xd9, 0xf1, 0xd9, 0xc0, 0xd9, 0xfc, 0xdc, 0xe1, 0xd9, 0xc9, 0xd9, 0xe0, 0xd9, 0xf0,
+            0xd9, 0xe8, 0xde, 0xc1, 0xd9, 0xfd, 0xdd, 0xd9,
+        ]);
+        cpu.x87_push(3.0); // exponent
+        cpu.x87_push(2.0); // base
+        for _ in 0..11 {
+            cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        }
+        assert!((cpu.x87_get(0) - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn x87_integer_load_supports_words_and_qwords() {
+        // fild word ptr [2000h]; fild qword ptr [2008h]
+        let (mut cpu, mut memory) = machine(&[
+            0xdf, 0x05, 0x00, 0x20, 0x00, 0x00, 0xdf, 0x2d, 0x08, 0x20, 0x00, 0x00,
+        ]);
+        memory
+            .write_u16(GuestAddress(0x2000), (-7_i16) as u16)
+            .unwrap();
+        memory
+            .write(GuestAddress(0x2008), &4_294_967_297_i64.to_le_bytes())
+            .unwrap();
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), -7.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 4_294_967_297.0);
+    }
+
+    #[test]
     fn x87_integer_store_uses_control_word_rounding() {
         // fistp dword ptr [2000h]
         let (mut cpu, mut memory) = machine(&[0xdb, 0x1d, 0x00, 0x20, 0x00, 0x00]);
@@ -3024,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn rep_movsb_obeys_direction_and_instruction_budgeting() {
+    fn rep_movsb_executes_in_bounded_chunks() {
         // cld; rep movsb
         let (mut cpu, mut memory) = machine(&[0xfc, 0xf3, 0xa4]);
         memory.write(GuestAddress(0x2000), &[1, 2, 3, 4]).unwrap();
@@ -3033,13 +3380,8 @@ mod tests {
         cpu.state.registers.ecx = 4;
 
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
-        for remaining in (0..4).rev() {
-            cpu.step(&mut memory, &NoExternalTargets).unwrap();
-            assert_eq!(cpu.state.registers.ecx, remaining);
-            if remaining != 0 {
-                assert_eq!(cpu.state.registers.eip, 0x1001);
-            }
-        }
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.ecx, 0);
         let mut copied = [0; 4];
         memory.read(GuestAddress(0x2020), &mut copied).unwrap();
         assert_eq!(copied, [1, 2, 3, 4]);
@@ -3053,7 +3395,7 @@ mod tests {
         cpu.state.registers.esi = 0x2003;
         cpu.state.registers.edi = 0x2023;
         cpu.state.registers.ecx = 4;
-        for _ in 0..6 {
+        for _ in 0..3 {
             cpu.step(&mut memory, &NoExternalTargets).unwrap();
         }
         memory.read(GuestAddress(0x2020), &mut copied).unwrap();
@@ -3072,7 +3414,7 @@ mod tests {
         cpu.state.registers.esi = 0x2000;
         cpu.state.registers.edi = 0x2020;
         cpu.state.registers.ecx = 4;
-        for _ in 0..4 {
+        for _ in 0..2 {
             cpu.step(&mut memory, &NoExternalTargets).unwrap();
         }
         assert_eq!(cpu.state.registers.ecx, 1);
@@ -3086,7 +3428,7 @@ mod tests {
         cpu.state.registers.eax = 3;
         cpu.state.registers.edi = 0x2020;
         cpu.state.registers.ecx = 4;
-        for _ in 0..4 {
+        for _ in 0..2 {
             cpu.step(&mut memory, &NoExternalTargets).unwrap();
         }
         assert_eq!(cpu.state.registers.ecx, 1);
@@ -3101,7 +3443,6 @@ mod tests {
         cpu.state.registers.eax = 0x1234_5678;
         cpu.state.registers.edi = 0x2020;
         cpu.state.registers.ecx = 2;
-        cpu.step(&mut memory, &NoExternalTargets).unwrap();
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         assert_eq!(memory.read_u32(GuestAddress(0x2020)).unwrap(), 0x1234_5678);

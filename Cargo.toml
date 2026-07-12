@@ -61,3 +61,11 @@ all = "warn"
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# Fast relinking for target-frontier development. The final release profile
+# keeps thin LTO; this profile favors iteration speed while retaining optimized
+# interpreter code.
+[profile.frontier]
+inherits = "release"
+codegen-units = 16
+lto = false
