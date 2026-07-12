@@ -5,7 +5,8 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    fs,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -114,8 +115,24 @@ impl ModuleTable {
     }
 }
 
+/// One seekable read-only file owned by the virtual filesystem boundary.
+pub trait VirtualReadFile: Send {
+    /// Read at most `length` bytes from the current cursor.
+    fn read(&mut self, length: usize) -> Result<Vec<u8>, Win32Error>;
+    /// Move the cursor relative to start, current position, or end.
+    fn seek(&mut self, distance: i64, origin: u32) -> Result<u64, Win32Error>;
+    /// Exact byte length of the file.
+    fn len(&self) -> u64;
+    /// Whether the file has no bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Minimal filesystem boundary used by file-oriented Win32 APIs.
 pub trait VirtualFileSystem: Send + Sync {
+    /// Open a guest-visible path without loading its complete contents.
+    fn open_read(&self, path: &str) -> Result<Box<dyn VirtualReadFile>, Win32Error>;
     /// Read the complete contents of a guest-visible path.
     fn read(&self, path: &str) -> Result<Vec<u8>, Win32Error>;
     /// Replace a guest-visible file.
@@ -157,6 +174,12 @@ pub struct FileEntry {
 pub struct UnsupportedFileSystem;
 
 impl VirtualFileSystem for UnsupportedFileSystem {
+    fn open_read(&self, _path: &str) -> Result<Box<dyn VirtualReadFile>, Win32Error> {
+        Err(Win32Error::Unsupported {
+            feature: "virtual filesystem streaming reads",
+        })
+    }
+
     fn read(&self, _path: &str) -> Result<Vec<u8>, Win32Error> {
         Err(Win32Error::Unsupported {
             feature: "virtual filesystem reads",
@@ -197,6 +220,45 @@ impl VirtualFileSystem for UnsupportedFileSystem {
         Err(Win32Error::Unsupported {
             feature: "virtual filesystem enumeration",
         })
+    }
+}
+
+struct HostReadFile {
+    file: File,
+    length: u64,
+    guest_path: String,
+}
+
+impl VirtualReadFile for HostReadFile {
+    fn read(&mut self, length: usize) -> Result<Vec<u8>, Win32Error> {
+        let mut bytes = vec![0; length];
+        let read = self.file.read(&mut bytes).map_err(|error| Win32Error::Io {
+            operation: "read",
+            path: self.guest_path.clone(),
+            message: error.to_string(),
+        })?;
+        bytes.truncate(read);
+        Ok(bytes)
+    }
+
+    fn seek(&mut self, distance: i64, origin: u32) -> Result<u64, Win32Error> {
+        let position = match origin {
+            0 => u64::try_from(distance)
+                .map(SeekFrom::Start)
+                .map_err(|_| Win32Error::InvalidArgument("negative file seek"))?,
+            1 => SeekFrom::Current(distance),
+            2 => SeekFrom::End(distance),
+            _ => return Err(Win32Error::InvalidArgument("invalid file seek origin")),
+        };
+        self.file.seek(position).map_err(|error| Win32Error::Io {
+            operation: "seek",
+            path: self.guest_path.clone(),
+            message: error.to_string(),
+        })
+    }
+
+    fn len(&self) -> u64 {
+        self.length
     }
 }
 
@@ -312,6 +374,28 @@ impl SandboxFileSystem {
 }
 
 impl VirtualFileSystem for SandboxFileSystem {
+    fn open_read(&self, path: &str) -> Result<Box<dyn VirtualReadFile>, Win32Error> {
+        let resolved = self.resolve_existing(path)?;
+        let file = File::open(&resolved).map_err(|error| Win32Error::Io {
+            operation: "open",
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+        let length = file
+            .metadata()
+            .map_err(|error| Win32Error::Io {
+                operation: "metadata",
+                path: path.to_owned(),
+                message: error.to_string(),
+            })?
+            .len();
+        Ok(Box::new(HostReadFile {
+            file,
+            length,
+            guest_path: path.to_owned(),
+        }))
+    }
+
     fn read(&self, path: &str) -> Result<Vec<u8>, Win32Error> {
         let resolved = self.resolve_existing(path)?;
         fs::read(&resolved).map_err(|error| Win32Error::Io {
@@ -454,12 +538,16 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 
 struct OpenFile {
     path: String,
-    bytes: Vec<u8>,
-    cursor: usize,
+    storage: OpenFileStorage,
     readable: bool,
     writable: bool,
     dirty: bool,
     directory: bool,
+}
+
+enum OpenFileStorage {
+    Stream(Box<dyn VirtualReadFile>),
+    Buffered { bytes: Vec<u8>, cursor: usize },
 }
 
 struct DirectorySearch {
@@ -499,9 +587,8 @@ impl ProcessIo {
         writable: bool,
         disposition: u32,
     ) -> Result<(Handle, bool), Win32Error> {
-        let existing = self.filesystem.read(path).ok();
-        let existed = existing.is_some();
-        let (bytes, create_empty) = match disposition {
+        let existed = self.filesystem.metadata(path).is_ok();
+        let create_empty = match disposition {
             1 if existed => {
                 return Err(Win32Error::Io {
                     operation: "create",
@@ -509,18 +596,17 @@ impl ProcessIo {
                     message: "file already exists".to_owned(),
                 });
             }
-            1 => (Vec::new(), true), // CREATE_NEW
-            2 => (Vec::new(), true), // CREATE_ALWAYS
-            3 => (
-                existing.ok_or_else(|| Win32Error::Io {
+            1 | 2 => true, // CREATE_NEW / CREATE_ALWAYS
+            3 if !existed => {
+                return Err(Win32Error::Io {
                     operation: "open",
                     path: path.to_owned(),
                     message: "file does not exist".to_owned(),
-                })?,
-                false,
-            ), // OPEN_EXISTING
-            4 => (existing.unwrap_or_default(), !existed), // OPEN_ALWAYS
-            5 if existed && writable => (Vec::new(), true), // TRUNCATE_EXISTING
+                });
+            }
+            3 => false,                       // OPEN_EXISTING
+            4 => !existed,                    // OPEN_ALWAYS
+            5 if existed && writable => true, // TRUNCATE_EXISTING
             5 => {
                 return Err(Win32Error::Io {
                     operation: "truncate",
@@ -535,12 +621,21 @@ impl ProcessIo {
             }
         };
         if create_empty {
-            self.filesystem.write(path, &bytes)?;
+            self.filesystem.write(path, &[])?;
         }
+        let storage = if !writable && !create_empty {
+            OpenFileStorage::Stream(self.filesystem.open_read(path)?)
+        } else {
+            let bytes = if create_empty {
+                Vec::new()
+            } else {
+                self.filesystem.read(path)?
+            };
+            OpenFileStorage::Buffered { bytes, cursor: 0 }
+        };
         let handle = self.files.insert(OpenFile {
             path: path.to_owned(),
-            bytes,
-            cursor: 0,
+            storage,
             readable,
             writable,
             dirty: false,
@@ -561,8 +656,10 @@ impl ProcessIo {
         }
         self.files.insert(OpenFile {
             path: path.to_owned(),
-            bytes: Vec::new(),
-            cursor: 0,
+            storage: OpenFileStorage::Buffered {
+                bytes: Vec::new(),
+                cursor: 0,
+            },
             readable: false,
             writable: false,
             dirty: false,
@@ -579,13 +676,18 @@ impl ProcessIo {
         if file.directory || !file.readable {
             return Err(Win32Error::InvalidHandle(handle.0));
         }
-        if file.cursor >= file.bytes.len() {
-            return Ok(Vec::new());
+        match &mut file.storage {
+            OpenFileStorage::Stream(stream) => stream.read(length),
+            OpenFileStorage::Buffered { bytes, cursor } => {
+                if *cursor >= bytes.len() {
+                    return Ok(Vec::new());
+                }
+                let end = cursor.saturating_add(length).min(bytes.len());
+                let output = bytes[*cursor..end].to_vec();
+                *cursor = end;
+                Ok(output)
+            }
         }
-        let end = file.cursor.saturating_add(length).min(file.bytes.len());
-        let bytes = file.bytes[file.cursor..end].to_vec();
-        file.cursor = end;
-        Ok(bytes)
     }
 
     /// Create one Guest directory within the configured filesystem root.
@@ -634,7 +736,10 @@ impl ProcessIo {
             .remove(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
         if file.dirty {
-            self.filesystem.write(&file.path, &file.bytes)?;
+            let OpenFileStorage::Buffered { bytes, .. } = &file.storage else {
+                return Err(Win32Error::InvalidHandle(handle.0));
+            };
+            self.filesystem.write(&file.path, bytes)?;
         }
         Ok(())
     }
@@ -648,15 +753,21 @@ impl ProcessIo {
         if file.directory || !file.writable {
             return Err(Win32Error::InvalidHandle(handle.0));
         }
-        let end = file
-            .cursor
+        let OpenFileStorage::Buffered {
+            bytes: data,
+            cursor,
+        } = &mut file.storage
+        else {
+            return Err(Win32Error::InvalidHandle(handle.0));
+        };
+        let end = cursor
             .checked_add(bytes.len())
             .ok_or(Win32Error::OutOfMemory)?;
-        if file.bytes.len() < end {
-            file.bytes.resize(end, 0);
+        if data.len() < end {
+            data.resize(end, 0);
         }
-        file.bytes[file.cursor..end].copy_from_slice(bytes);
-        file.cursor = end;
+        data[*cursor..end].copy_from_slice(bytes);
+        *cursor = end;
         file.dirty = true;
         Ok(bytes.len())
     }
@@ -670,7 +781,10 @@ impl ProcessIo {
         if !file.writable {
             return Err(Win32Error::InvalidHandle(handle.0));
         }
-        file.bytes.resize(file.cursor, 0);
+        let OpenFileStorage::Buffered { bytes, cursor } = &mut file.storage else {
+            return Err(Win32Error::InvalidHandle(handle.0));
+        };
+        bytes.resize(*cursor, 0);
         file.dirty = true;
         Ok(())
     }
@@ -682,7 +796,10 @@ impl ProcessIo {
             .get_mut(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
         if file.dirty {
-            self.filesystem.write(&file.path, &file.bytes)?;
+            let OpenFileStorage::Buffered { bytes, .. } = &file.storage else {
+                return Err(Win32Error::InvalidHandle(handle.0));
+            };
+            self.filesystem.write(&file.path, bytes)?;
             file.dirty = false;
         }
         Ok(())
@@ -730,8 +847,11 @@ impl ProcessIo {
             .files
             .get(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
-        u64::try_from(file.bytes.len())
-            .map_err(|_| Win32Error::InvalidArgument("file size exceeds u64"))
+        match &file.storage {
+            OpenFileStorage::Stream(stream) => Ok(stream.len()),
+            OpenFileStorage::Buffered { bytes, .. } => u64::try_from(bytes.len())
+                .map_err(|_| Win32Error::InvalidArgument("file size exceeds u64")),
+        }
     }
 
     /// Move an open file cursor relative to start, current position, or end.
@@ -740,23 +860,28 @@ impl ProcessIo {
             .files
             .get_mut(handle)
             .ok_or(Win32Error::InvalidHandle(handle.0))?;
-        let base = match origin {
-            0 => 0,
-            1 => i64::try_from(file.cursor)
-                .map_err(|_| Win32Error::InvalidArgument("file cursor exceeds i64"))?,
-            2 => i64::try_from(file.bytes.len())
-                .map_err(|_| Win32Error::InvalidArgument("file size exceeds i64"))?,
-            _ => return Err(Win32Error::InvalidArgument("invalid file seek origin")),
-        };
-        let position = base
-            .checked_add(distance)
-            .filter(|position| *position >= 0)
-            .ok_or(Win32Error::InvalidArgument(
-                "negative or overflowing file seek",
-            ))?;
-        file.cursor = usize::try_from(position)
-            .map_err(|_| Win32Error::InvalidArgument("file seek exceeds host usize"))?;
-        Ok(position as u64)
+        match &mut file.storage {
+            OpenFileStorage::Stream(stream) => stream.seek(distance, origin),
+            OpenFileStorage::Buffered { bytes, cursor } => {
+                let base = match origin {
+                    0 => 0,
+                    1 => i64::try_from(*cursor)
+                        .map_err(|_| Win32Error::InvalidArgument("file cursor exceeds i64"))?,
+                    2 => i64::try_from(bytes.len())
+                        .map_err(|_| Win32Error::InvalidArgument("file size exceeds i64"))?,
+                    _ => return Err(Win32Error::InvalidArgument("invalid file seek origin")),
+                };
+                let position = base
+                    .checked_add(distance)
+                    .filter(|position| *position >= 0)
+                    .ok_or(Win32Error::InvalidArgument(
+                        "negative or overflowing file seek",
+                    ))?;
+                *cursor = usize::try_from(position)
+                    .map_err(|_| Win32Error::InvalidArgument("file seek exceeds host usize"))?;
+                Ok(position as u64)
+            }
+        }
     }
 
     /// Whether a handle refers to an open disk file.
@@ -1252,19 +1377,24 @@ pub fn read_ansi_z(
         let mut byte = [0];
         context.read_memory(GuestAddress(current), &mut byte)?;
         if byte[0] == 0 {
-            let (decoded, had_errors) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(&bytes);
-            if had_errors {
-                return Err(Win32Error::InvalidArgument(
-                    "invalid Windows Shift-JIS string",
-                ));
-            }
-            return Ok(decoded.into_owned());
+            return Ok(decode_ansi(&bytes));
         }
         bytes.push(byte[0]);
     }
     Err(Win32Error::InvalidArgument(
         "unterminated ANSI guest string",
     ))
+}
+
+fn decode_ansi(bytes: &[u8]) -> String {
+    // Win32 "A" APIs do not make arbitrary application byte strings a Rust
+    // validity boundary. Without MB_ERR_INVALID_CHARS, Windows conversion
+    // replaces malformed sequences and continues. This is especially
+    // important for legacy games that mix locale-specific bytes in captions.
+    encoding_rs::SHIFT_JIS
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
 }
 
 /// Read a bounded NUL-terminated UTF-16LE string from guest memory.
@@ -1489,6 +1619,11 @@ mod tests {
     }
 
     #[test]
+    fn ansi_decoding_replaces_malformed_sequences() {
+        assert_eq!(decode_ansi(&[0x82]), "\u{fffd}");
+    }
+
+    #[test]
     fn sandbox_maps_only_its_configured_guest_root() {
         let filesystem = SandboxFileSystem::new("/tmp/vnrt-sandbox-test", r"C:\VNRT");
         assert!(filesystem.resolve("../secret.txt").is_err());
@@ -1532,6 +1667,8 @@ mod tests {
 
         let handle = io.open_read("SAVE.DAT").unwrap();
         assert_eq!(io.read(handle, 8).unwrap(), b"abc");
+        assert_eq!(io.seek(handle, 1, 0).unwrap(), 1);
+        assert_eq!(io.read(handle, 1).unwrap(), b"b");
         io.close(handle).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

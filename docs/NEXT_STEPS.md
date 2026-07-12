@@ -104,7 +104,7 @@ amount of compatibility surface, rather than broad Windows coverage.
   Kernel32 export census through filesystem, time, locale, process, mapping,
   and initial thread probes.
 
-## Next highest-leverage milestone: cross archive indexing efficiently
+## Next highest-leverage milestone: finish resource initialization
 
 The primary target is now `euphoriaCN.exe`. Its self-unpacking path completes,
 the NTDLL export census is resolved, and an unpacked child image is mapped near
@@ -116,14 +116,16 @@ The D3D9 and DirectSound modules now resolve, as does the absent optional
 `logprint.dll` probe family. NT-like heap size-class slack preserves the
 packer's generated trampoline, directory handles work with backup semantics,
 and DOS `*.*` enumeration now exposes the dotless `pac` directory. The engine
-opens all 15 observed YPF archives; a one-billion-instruction run currently
-ends at its configured limit during archive indexing/decryption, without a
-compatibility exception.
+opens all 15 observed YPF archives through seekable Host streams rather than
+copying them into RAM. Fixed ordinal exports now resolve the target's
+COMCTL32 #17 and DSOUND #1 imports correctly. The child crosses
+`CreateWindowExA` and reaches real resource keys such as `W0/CGS100`; the
+current executed frontier is x87 resource initialization.
 
-Profile and accelerate that hot path next. Once real D3D calls appear, build
-only the observed COM objects over `vnrt-gfx`; the wgpu backend already creates
-and uploads real Host GPU textures. Then connect the resulting swapchain image
-to an SDL3 native window.
+Continue the observed CPU/resource path until `Direct3DCreate9` actually
+executes. Then build only the COM methods the target calls over `vnrt-gfx`; the
+wgpu backend already creates and uploads real Host GPU textures. Finally attach
+the modeled User32 window and presented frame to a native SDL3 window.
 
 ## Following target milestone: complete target and first real window
 
@@ -134,8 +136,8 @@ must gain proper object lifetime and Guest scheduling semantics.
 1. Implement the target-observed Direct3D 9 creation and presentation path.
 2. Implement cooperative Guest thread contexts if `CreateThread` is actually
    invoked, including stacks, TLS, suspend counts, exit codes, and waits.
-3. Grow the User32 surface only from executed failures until `CreateWindowExA`,
-   then attach the first SDL3 native window.
+3. Attach the already-modeled `CreateWindowExA` window to the first SDL3 native
+   window once the target has a presentable frame.
 
 ## Following low-level milestones
 
@@ -155,7 +157,7 @@ must gain proper object lifetime and Guest scheduling semantics.
 ### Loader completion
 
 - Apply `IMAGE_REL_BASED_HIGHLOW` when the preferred image base is unavailable.
-- Add ordinal API keys and delay-import parsing only when encountered in a target.
+- Add delay-import parsing only when encountered in a target.
 - Validate overlapping sections and alignment rules more deeply.
 
 ### Minimal Win32 path
@@ -172,5 +174,6 @@ must gain proper object lifetime and Guest scheduling semantics.
 
 ## Explicit non-goals for now
 
-- JIT compilation, x64 guests, drivers, COM, registry emulation, networking,
-  Direct3D, broad GDI coverage, and general Windows application compatibility.
+- JIT compilation, x64 guests, drivers, broad COM/Direct3D coverage, registry
+  emulation, networking, broad GDI coverage, and general Windows application
+  compatibility.

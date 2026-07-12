@@ -6,6 +6,10 @@ const MODULE: &str = "comctl32.dll";
 
 /// Register the common-controls APIs currently required by the selected Guest.
 pub fn register(registry: &mut ApiRegistry) {
+    // Legacy applications commonly import InitCommonControls by its stable
+    // COMCTL32 ordinal instead of by name. Keep both identities backed by the
+    // same stateless implementation so synthetic PE exports can expose #17.
+    registry.register(ApiKey::new(MODULE, "#17"), InitCommonControls);
     registry.register(
         ApiKey::new(MODULE, "InitCommonControls"),
         InitCommonControls,
@@ -53,6 +57,7 @@ mod tests {
     fn registers_common_control_initializers() {
         let mut registry = ApiRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 3);
+        assert!(registry.resolve(&ApiKey::new(MODULE, "#17")).is_some());
     }
 }

@@ -110,9 +110,21 @@ Two Win32 filesystem details then unlocked the real content path:
 - DOS `*.*` matches entries without a dot, so the engine now discovers `pac`.
 
 The target consequently enumerates all 15 local YPF archives and opens the
-script, image, voice, and update packs. A one-billion-instruction run now stops
-inside archive indexing/decryption rather than at a compatibility exception.
-No Guest D3D method has executed yet; CPU throughput is the immediate frontier.
+script, image, voice, and update packs. Existing read-only handles now stream
+from seekable Host files, avoiding an in-memory copy of the 1.6 GB `cg.ypf` and
+keeping deep target runs around 100 MB RSS.
+
+The unpacked child's ordinal imports exposed a correctness issue in synthetic
+DLL export tables. COMCTL32 ordinal 17 and DSOUND ordinal 1 now occupy their
+real export slots, allowing the target to cross main-window creation. ANSI
+window captions use Windows-compatible replacement for malformed Shift-JIS
+sequences rather than turning application bytes into a fatal Rust error.
+
+The current executed path has crossed `CreateWindowExA` and reached real
+resource keys such as `W0/CGS100`. Newly observed `FSQRT`, x87 arithmetic,
+`SHLD`/`SHRD`, `JECXZ`, and 64-bit `FISTP` are implemented with focused tests.
+No Guest D3D method has executed yet; the immediate frontier remains resource
+initialization before `Direct3DCreate9`.
 
 The Host graphics substrate now uses wgpu 30 and has been verified locally to
 select a real GPU, create an RGBA render-target texture, upload pixels, and

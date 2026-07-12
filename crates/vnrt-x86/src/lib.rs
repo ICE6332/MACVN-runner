@@ -31,6 +31,8 @@ pub struct TracedInstruction {
     pub bytes: Vec<u8>,
     /// iced-x86 instruction debug representation.
     pub instruction: String,
+    /// Register state immediately before execution.
+    pub registers: Registers,
 }
 
 /// Kind of non-linear Guest control transfer retained for diagnostics.
@@ -708,6 +710,7 @@ impl Interpreter {
             length: instruction.len(),
             bytes,
             instruction: format!("{instruction:?}"),
+            registers: self.state.registers,
         });
         Ok(())
     }
@@ -771,8 +774,19 @@ impl Interpreter {
                 self.x87_push(f64::from(value));
                 self.state.registers.eip = next_ip;
             }
-            Mnemonic::Fadd | Mnemonic::Fmul => {
+            Mnemonic::Fadd
+            | Mnemonic::Faddp
+            | Mnemonic::Fsub
+            | Mnemonic::Fsubp
+            | Mnemonic::Fsubr
+            | Mnemonic::Fsubrp
+            | Mnemonic::Fmul
+            | Mnemonic::Fmulp => {
                 self.execute_x87_binary(memory, instruction)?;
+                self.state.registers.eip = next_ip;
+            }
+            Mnemonic::Fsqrt => {
+                self.x87_set(0, self.x87_get(0).sqrt());
                 self.state.registers.eip = next_ip;
             }
             Mnemonic::Fld => {
@@ -827,12 +841,6 @@ impl Interpreter {
             }
             Mnemonic::Fistp => {
                 let address = self.effective_address(instruction, true)?;
-                if instruction.memory_size() != MemorySize::Int32 {
-                    return Err(CpuError::UnsupportedOperand {
-                        address: instruction.ip32(),
-                        detail: "unsupported FISTP memory width".to_owned(),
-                    });
-                }
                 let value = self.x87_get(0);
                 let rounded = match (self.state.x87_control_word >> 10) & 3 {
                     0 => value.round_ties_even(),
@@ -841,15 +849,50 @@ impl Interpreter {
                     3 => value.trunc(),
                     _ => unreachable!(),
                 };
-                let integer = if rounded.is_finite()
-                    && rounded >= f64::from(i32::MIN)
-                    && rounded <= f64::from(i32::MAX)
-                {
-                    rounded as i32
-                } else {
-                    i32::MIN
-                };
-                memory.write_u32(address, integer as u32)?;
+                match instruction.memory_size() {
+                    MemorySize::Int16 => {
+                        let integer = if rounded.is_finite()
+                            && rounded >= f64::from(i16::MIN)
+                            && rounded <= f64::from(i16::MAX)
+                        {
+                            rounded as i16
+                        } else {
+                            i16::MIN
+                        };
+                        memory.write_u16(address, integer as u16)?;
+                    }
+                    MemorySize::Int32 => {
+                        let integer = if rounded.is_finite()
+                            && rounded >= f64::from(i32::MIN)
+                            && rounded <= f64::from(i32::MAX)
+                        {
+                            rounded as i32
+                        } else {
+                            i32::MIN
+                        };
+                        memory.write_u32(address, integer as u32)?;
+                    }
+                    MemorySize::Int64 => {
+                        // i64::MAX is not exactly representable as f64; use an
+                        // exclusive 2^63 upper bound to preserve x87's integer
+                        // indefinite result on overflow.
+                        let integer = if rounded.is_finite()
+                            && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+                                .contains(&rounded)
+                        {
+                            rounded as i64
+                        } else {
+                            i64::MIN
+                        };
+                        memory.write(address, &integer.to_le_bytes())?;
+                    }
+                    _ => {
+                        return Err(CpuError::UnsupportedOperand {
+                            address: instruction.ip32(),
+                            detail: "unsupported FISTP memory width".to_owned(),
+                        });
+                    }
+                }
                 self.x87_pop();
                 self.state.registers.eip = next_ip;
             }
@@ -935,6 +978,8 @@ impl Interpreter {
             Mnemonic::Shl | Mnemonic::Sal => self.execute_shift_left(memory, instruction)?,
             Mnemonic::Shr => self.execute_shift_right(memory, instruction, false)?,
             Mnemonic::Sar => self.execute_shift_right(memory, instruction, true)?,
+            Mnemonic::Shld => self.execute_double_shift(memory, instruction, true)?,
+            Mnemonic::Shrd => self.execute_double_shift(memory, instruction, false)?,
             Mnemonic::Rol => self.execute_rotate(memory, instruction, true)?,
             Mnemonic::Ror => self.execute_rotate(memory, instruction, false)?,
             Mnemonic::Neg => self.execute_negate(memory, instruction)?,
@@ -1015,6 +1060,13 @@ impl Interpreter {
             Mnemonic::Loop => {
                 self.state.registers.ecx = self.state.registers.ecx.wrapping_sub(1);
                 self.state.registers.eip = if self.state.registers.ecx != 0 {
+                    self.read_branch_target(memory, instruction, 0)?
+                } else {
+                    next_ip
+                };
+            }
+            Mnemonic::Jecxz => {
+                self.state.registers.eip = if self.state.registers.ecx == 0 {
                     self.read_branch_target(memory, instruction, 0)?
                 } else {
                     next_ip
@@ -1155,11 +1207,19 @@ impl Interpreter {
         };
         let destination_value = self.x87_get(destination);
         let result = match instruction.mnemonic() {
-            Mnemonic::Fadd => destination_value + source,
-            Mnemonic::Fmul => destination_value * source,
+            Mnemonic::Fadd | Mnemonic::Faddp => destination_value + source,
+            Mnemonic::Fsub | Mnemonic::Fsubp => destination_value - source,
+            Mnemonic::Fsubr | Mnemonic::Fsubrp => source - destination_value,
+            Mnemonic::Fmul | Mnemonic::Fmulp => destination_value * source,
             _ => unreachable!(),
         };
         self.x87_set(destination, result);
+        if matches!(
+            instruction.mnemonic(),
+            Mnemonic::Faddp | Mnemonic::Fsubp | Mnemonic::Fsubrp | Mnemonic::Fmulp
+        ) {
+            self.x87_pop();
+        }
         Ok(())
     }
 
@@ -1315,6 +1375,49 @@ impl Interpreter {
             }
             if !arithmetic && count == 1 && value & width.sign_bit() != 0 {
                 flags |= FLAG_OF;
+            }
+            self.state.registers.replace_flags(LOGIC_FLAGS, flags);
+            let target = self.operand_target(instruction, 0)?;
+            self.write_target(memory, instruction, target, result)?;
+        }
+        self.state.registers.eip = instruction.next_ip32();
+        Ok(())
+    }
+
+    fn execute_double_shift(
+        &mut self,
+        memory: &mut GuestMemory,
+        instruction: &Instruction,
+        left: bool,
+    ) -> Result<(), CpuError> {
+        let width = self.operand_width(instruction, 0)?;
+        let destination = width.truncate(self.read_operand(memory, instruction, 0)?);
+        let source = width.truncate(self.read_operand(memory, instruction, 1)?);
+        let count = self.read_operand(memory, instruction, 2)? & 0x1f;
+        if count != 0 && count <= width.bits() {
+            let result = if left {
+                width.truncate((destination << count) | (source >> (width.bits() - count)))
+            } else {
+                width.truncate((destination >> count) | (source << (width.bits() - count)))
+            };
+            let carry = if left {
+                destination >> (width.bits() - count) & 1 != 0
+            } else {
+                destination >> (count - 1) & 1 != 0
+            };
+            let mut flags = common_flags(result, width);
+            if carry {
+                flags |= FLAG_CF;
+            }
+            if count == 1 {
+                let overflow = if left {
+                    (result & width.sign_bit() != 0) != carry
+                } else {
+                    (destination & width.sign_bit() != 0) != (result & width.sign_bit() != 0)
+                };
+                if overflow {
+                    flags |= FLAG_OF;
+                }
             }
             self.state.registers.replace_flags(LOGIC_FLAGS, flags);
             let target = self.operand_target(instruction, 0)?;
@@ -2125,6 +2228,7 @@ fn is_block_terminal(instruction: &Instruction) -> bool {
             | Mnemonic::Ret
             | Mnemonic::Jmp
             | Mnemonic::Loop
+            | Mnemonic::Jecxz
             | Mnemonic::Hlt
             | Mnemonic::Int3
     ) || is_conditional_jump(instruction.mnemonic())
@@ -2480,6 +2584,24 @@ mod tests {
     }
 
     #[test]
+    fn jecxz_tests_ecx_without_changing_flags() {
+        // jecxz +2; nop; nop; nop
+        let (mut cpu, mut memory) = machine(&[0xe3, 0x02, 0x90, 0x90, 0x90]);
+        cpu.state.registers.ecx = 0;
+        cpu.state.registers.eflags = 0x246;
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.eip, 0x1004);
+        assert_eq!(cpu.state.registers.eflags, 0x246);
+
+        cpu.state.registers.eip = 0x1000;
+        cpu.state.registers.ecx = 2;
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.state.registers.eip, 0x1002);
+        assert_eq!(cpu.state.registers.ecx, 2);
+        assert_eq!(cpu.state.registers.eflags, 0x246);
+    }
+
+    #[test]
     fn calls_and_returns_through_the_guest_stack() {
         // call +1; nop; mov eax,42; ret
         let code = [0xe8, 1, 0, 0, 0, 0x90, 0xb8, 42, 0, 0, 0, 0xc3];
@@ -2569,12 +2691,37 @@ mod tests {
     }
 
     #[test]
+    fn x87_square_root_and_reverse_subtraction_execute() {
+        // fsqrt; fsubr st(0),st(1)
+        let (mut cpu, mut memory) = machine(&[0xd9, 0xfa, 0xd8, 0xe9]);
+        cpu.x87_push(10.0);
+        cpu.x87_push(9.0);
+
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 3.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        assert_eq!(cpu.x87_get(0), 7.0);
+    }
+
+    #[test]
     fn x87_integer_store_uses_control_word_rounding() {
         // fistp dword ptr [2000h]
         let (mut cpu, mut memory) = machine(&[0xdb, 0x1d, 0x00, 0x20, 0x00, 0x00]);
         cpu.x87_push(2.5);
         cpu.step(&mut memory, &NoExternalTargets).unwrap();
         assert_eq!(memory.read_u32(GuestAddress(0x2000)).unwrap(), 2);
+        assert_eq!(cpu.state.x87_top, 0);
+    }
+
+    #[test]
+    fn x87_integer_store_supports_qwords() {
+        // fistp qword ptr [2000h]
+        let (mut cpu, mut memory) = machine(&[0xdf, 0x3d, 0x00, 0x20, 0x00, 0x00]);
+        cpu.x87_push(4_294_967_297.0);
+        cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        let mut bytes = [0_u8; 8];
+        memory.read(GuestAddress(0x2000), &mut bytes).unwrap();
+        assert_eq!(i64::from_le_bytes(bytes), 4_294_967_297);
         assert_eq!(cpu.state.x87_top, 0);
     }
 
@@ -2763,6 +2910,23 @@ mod tests {
         assert_eq!(cpu.state.registers.eax, 1_234_567);
         assert_eq!(cpu.state.registers.edx, 0);
         assert_eq!(cpu.state.registers.ebx, 38_580);
+    }
+
+    #[test]
+    fn executes_double_precision_shifts() {
+        // mov eax,12345678h; mov ebx,9abcdef0h;
+        // shld eax,ebx,8; shrd ebx,eax,8
+        let code = [
+            0xb8, 0x78, 0x56, 0x34, 0x12, 0xbb, 0xf0, 0xde, 0xbc, 0x9a, 0x0f, 0xa4, 0xd8, 0x08,
+            0x0f, 0xac, 0xc3, 0x08,
+        ];
+        let (mut cpu, mut memory) = machine(&code);
+        for _ in 0..4 {
+            cpu.step(&mut memory, &NoExternalTargets).unwrap();
+        }
+
+        assert_eq!(cpu.state.registers.eax, 0x3456_789a);
+        assert_eq!(cpu.state.registers.ebx, 0x9a9a_bcde);
     }
 
     #[test]

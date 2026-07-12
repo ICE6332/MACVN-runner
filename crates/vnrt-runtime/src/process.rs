@@ -68,12 +68,56 @@ pub(super) fn initialize_host_module_image(
     module: &str,
     base: GuestAddress,
 ) -> Result<(), RuntimeError> {
-    let mut exports = registry
+    let module_exports = registry
         .registered_keys()
         .into_iter()
-        .filter(|key| key.module == module && !key.name.starts_with('#'))
+        .filter(|key| key.module == module)
         .collect::<Vec<_>>();
-    exports.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut named_exports = module_exports
+        .iter()
+        .filter(|key| !key.name.starts_with('#'))
+        .cloned()
+        .collect::<Vec<_>>();
+    named_exports.sort_by(|left, right| left.name.cmp(&right.name));
+
+    // IMAGE_EXPORT_DIRECTORY indexes functions relative to Base (1 here).
+    // Preserve explicit ordinal identities such as COMCTL32!#17, then place
+    // named exports into the remaining slots. Holes are valid PE entries and
+    // remain zero, just as they do in native DLL export tables.
+    let mut function_slots = Vec::<Option<ApiKey>>::new();
+    for key in module_exports
+        .iter()
+        .filter(|key| key.name.starts_with('#'))
+    {
+        let ordinal = key.name[1..]
+            .parse::<u16>()
+            .map_err(|_| RuntimeError::Unsupported("invalid synthetic export ordinal"))?;
+        if ordinal == 0 {
+            return Err(RuntimeError::Unsupported("zero synthetic export ordinal"));
+        }
+        let index = usize::from(ordinal - 1);
+        if function_slots.len() <= index {
+            function_slots.resize(index + 1, None);
+        }
+        if function_slots[index].replace(key.clone()).is_some() {
+            return Err(RuntimeError::Unsupported(
+                "duplicate synthetic export ordinal",
+            ));
+        }
+    }
+
+    let mut named_slots = Vec::with_capacity(named_exports.len());
+    for key in named_exports {
+        let index = function_slots
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(function_slots.len());
+        if index == function_slots.len() {
+            function_slots.push(None);
+        }
+        function_slots[index] = Some(key.clone());
+        named_slots.push((key, index));
+    }
 
     memory.map_range(base, HOST_MODULE_IMAGE_SIZE, Permissions::READ_WRITE)?;
     memory.write(base, b"MZ")?;
@@ -85,18 +129,20 @@ pub(super) fn initialize_host_module_image(
 
     let export_directory_rva = 0x200_u32;
     let export_directory = GuestAddress(base.0 + export_directory_rva);
-    let export_count = u32::try_from(exports.len())
+    let function_count = u32::try_from(function_slots.len())
         .map_err(|_| RuntimeError::Unsupported("too many synthetic module exports"))?;
+    let name_count = u32::try_from(named_slots.len())
+        .map_err(|_| RuntimeError::Unsupported("too many synthetic named exports"))?;
     let functions_rva = 0x228_u32;
     let names_rva = functions_rva
-        .checked_add(export_count.saturating_mul(4))
+        .checked_add(function_count.saturating_mul(4))
         .ok_or(RuntimeError::Unsupported("synthetic export table overflow"))?;
     let ordinals_rva = names_rva
-        .checked_add(export_count.saturating_mul(4))
+        .checked_add(name_count.saturating_mul(4))
         .ok_or(RuntimeError::Unsupported("synthetic export table overflow"))?;
     let mut string_rva = align_up(
         ordinals_rva
-            .checked_add(export_count.saturating_mul(2))
+            .checked_add(name_count.saturating_mul(2))
             .ok_or(RuntimeError::Unsupported("synthetic export table overflow"))?,
         4,
     )
@@ -112,7 +158,10 @@ pub(super) fn initialize_host_module_image(
             "synthetic export strings overflow",
         ))?;
 
-    for (index, key) in exports.iter().enumerate() {
+    for (index, key) in function_slots.iter().enumerate() {
+        let Some(key) = key else {
+            continue;
+        };
         let thunk = if let Some((address, _)) =
             import_thunks.iter().find(|(_, existing)| *existing == key)
         {
@@ -134,11 +183,20 @@ pub(super) fn initialize_host_module_image(
             GuestAddress(base.0 + functions_rva + index * 4),
             thunk.0.wrapping_sub(base.0),
         )?;
-        memory.write_u32(GuestAddress(base.0 + names_rva + index * 4), string_rva)?;
+    }
+
+    for (name_index, (key, function_index)) in named_slots.iter().enumerate() {
+        let name_index = u32::try_from(name_index)
+            .map_err(|_| RuntimeError::Unsupported("synthetic export index overflow"))?;
+        let function_index = u16::try_from(*function_index)
+            .map_err(|_| RuntimeError::Unsupported("synthetic export ordinal overflow"))?;
+        memory.write_u32(
+            GuestAddress(base.0 + names_rva + name_index * 4),
+            string_rva,
+        )?;
         memory.write_u16(
-            GuestAddress(base.0 + ordinals_rva + index * 2),
-            u16::try_from(index)
-                .map_err(|_| RuntimeError::Unsupported("synthetic export ordinal overflow"))?,
+            GuestAddress(base.0 + ordinals_rva + name_index * 2),
+            function_index,
         )?;
         let mut name = key.name.as_bytes().to_vec();
         name.push(0);
@@ -153,8 +211,8 @@ pub(super) fn initialize_host_module_image(
 
     memory.write_u32(GuestAddress(export_directory.0 + 12), module_name_rva)?;
     memory.write_u32(GuestAddress(export_directory.0 + 16), 1)?;
-    memory.write_u32(GuestAddress(export_directory.0 + 20), export_count)?;
-    memory.write_u32(GuestAddress(export_directory.0 + 24), export_count)?;
+    memory.write_u32(GuestAddress(export_directory.0 + 20), function_count)?;
+    memory.write_u32(GuestAddress(export_directory.0 + 24), name_count)?;
     memory.write_u32(GuestAddress(export_directory.0 + 28), functions_rva)?;
     memory.write_u32(GuestAddress(export_directory.0 + 32), names_rva)?;
     memory.write_u32(GuestAddress(export_directory.0 + 36), ordinals_rva)?;

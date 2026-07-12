@@ -180,6 +180,38 @@ fn synthetic_kernel32_image_exports_registered_host_thunks() {
 }
 
 #[test]
+fn synthetic_module_preserves_explicit_export_ordinals() {
+    let image = image_with_one_import();
+    let mut registry = ApiRegistry::new();
+    registry.register(
+        ApiKey::new("comctl32.dll", "#17"),
+        vnrt_win32::UnsupportedApi::new("ordinal export test"),
+    );
+    let runtime = Runtime::load(&image, registry).expect("image should load");
+    let base = runtime.host_modules["comctl32.dll"];
+    let nt = base.0
+        + runtime
+            .memory
+            .read_u32(GuestAddress(base.0 + 0x3c))
+            .unwrap();
+    let export = base.0 + runtime.memory.read_u32(GuestAddress(nt + 0x78)).unwrap();
+    let function_count = runtime.memory.read_u32(GuestAddress(export + 20)).unwrap();
+    let functions_rva = runtime.memory.read_u32(GuestAddress(export + 28)).unwrap();
+    let ordinal_17_rva = runtime
+        .memory
+        .read_u32(GuestAddress(base.0 + functions_rva + 16 * 4))
+        .unwrap();
+
+    assert!(function_count >= 17);
+    assert_eq!(
+        runtime
+            .import_thunks
+            .get(&GuestAddress(base.0 + ordinal_17_rva)),
+        Some(&ApiKey::new("comctl32.dll", "#17"))
+    );
+}
+
+#[test]
 fn ordinal_imports_have_stable_host_call_keys() {
     let import = Import {
         module: "COMCTL32.dll".to_owned(),

@@ -18,6 +18,9 @@ VNRT keeps `iced-x86` as its decoder. The evaluated replacements either require 
 - Single-page `u8`, `u16`, and `u32` accesses bypass the generic cross-page walker.
 - Release builds use thin LTO with one codegen unit so the interpreter's
   cross-crate memory fast paths can inline.
+- Existing read-only Guest files use seekable Host streams. Writable/create
+  handles remain buffered so their current mutation and flush semantics stay
+  deterministic, while multi-gigabyte YPF archives are never cloned into RAM.
 
 On the local Chinese-launcher checkpoint, 20 million interpreted steps fell from roughly 3.0 seconds of CPU time to roughly 1.0 second. The 350-million-step target run reaches the same NTDLL-resolution boundary in roughly 9 seconds of CPU time; observed wall time varies with host scheduling.
 
@@ -45,3 +48,10 @@ one-billion-instruction target run from 66.45 to 59.87 seconds wall time. A
 five-second sample after the executable-epoch change reduced
 `block_is_valid` top-of-stack samples from 246 to 7; the next dominant safe
 targets are operand dispatch and repeated read-only archive opens.
+
+The streaming file path removes the second target entirely. On the same local
+Chinese target, a three-billion-instruction run now remains around 100 MB RSS
+while crossing archive indexing, main-window creation, and real resource keys.
+Observed system time stays around one to two seconds instead of repeatedly
+reading whole YPF files. The latest CPU frontier is ordinary target-generated
+x87 conversion and string/search code, not archive I/O or GPU work.

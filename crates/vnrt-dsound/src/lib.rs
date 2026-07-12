@@ -7,6 +7,9 @@ const DSERR_NODRIVER: u32 = 0x8878_0078;
 
 /// Register the DirectSound APIs currently required by the selected Guest.
 pub fn register(registry: &mut ApiRegistry) {
+    // DirectSoundCreate is also exported as ordinal 1 by the legacy DLL and
+    // the selected Guest imports that ordinal directly.
+    registry.register(ApiKey::new(MODULE, "#1"), DirectSoundCreate);
     registry.register(ApiKey::new(MODULE, "DirectSoundCreate"), DirectSoundCreate);
     registry.register(ApiKey::new(MODULE, "DirectSoundCreate8"), DirectSoundCreate);
     registry.register(
@@ -59,6 +62,7 @@ mod tests {
     fn registers_direct_sound_probe_surface() {
         let mut registry = ApiRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 5);
+        assert!(registry.resolve(&ApiKey::new(MODULE, "#1")).is_some());
     }
 }

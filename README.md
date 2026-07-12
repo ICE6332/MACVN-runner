@@ -9,8 +9,8 @@ This is not Wine and is not intended to run arbitrary Windows software.
 - PE32 loading, imports, TLS, TEB/PEB, memory, files, and callbacks work.
 - The runner covers a growing Kernel32/User32/GDI32/WinMM surface and can capture Guest DIB presentation as RGBA frames.
 - A backend-neutral graphics layer now owns real wgpu textures; wgpu selects Metal on macOS while leaving Vulkan, D3D12, and GLES available on other hosts.
-- The primary Chinese `euphoriaCN.exe` target now unpacks its child, loads the modeled D3D9/DirectSound modules, discovers `pac`, and opens the real YPF archives.
-- The current frontier is CPU throughput while the engine indexes/decrypts those archives; no Guest D3D method has executed yet.
+- The primary Chinese `euphoriaCN.exe` target now unpacks its child, opens the real YPF archives, creates its modeled main window, and enters real resource lookup.
+- Read-only archives stream from Host files, so the 1.6 GB `cg.ypf` is no longer copied into RAM. The current frontier is an x87 resource-initialization path; no Guest D3D method has executed yet.
 
 Game files are not included. Use only files you are legally allowed to run.
 
