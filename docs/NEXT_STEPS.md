@@ -141,13 +141,12 @@ blocking `WaitFor*` parks the current Guest context and schedules a Ready
 worker, and `SetEvent`/`ExitThread` wake waiters without Host-native threads.
 MMX coverage was extended for the post-wait pixel path.
 
-1. Run the target past the startup dialog and stop at the next bounded
-   CPU/API/frame frontier (expected: `Direct3DCreate9` or a small new gap).
-2. Implement the target-observed Direct3D 9 creation and presentation path.
+1. Run the target past the startup dialog into `Direct3DCreate9` (COM factory
+   and device vtables are now installed; tighten methods the game actually
+   calls, especially texture upload and `Present`).
+2. Attach the modeled User32 window / presented frame to an SDL3 native window.
 3. Extend cooperative scheduling only as the target demands it (finite wait
    timeouts, file-mapping waitables, broader TLS template copy).
-4. Attach the already-modeled `CreateWindowExA` window to the first SDL3 native
-   window once the target has a presentable frame.
 
 ## Following low-level milestones
 

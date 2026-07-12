@@ -1486,6 +1486,7 @@ dependencies = [
 name = "vnrt-d3d9"
 version = "0.1.0"
 dependencies = [
+ "tracing",
  "vnrt-win32",
 ]
 

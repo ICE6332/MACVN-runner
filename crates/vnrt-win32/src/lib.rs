@@ -14,7 +14,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
-pub use vnrt_gfx::{TextureDescriptor, TextureId};
+pub use vnrt_gfx::{TextureDescriptor, TextureFormat, TextureId};
 pub use vnrt_memory::GuestAddress;
 
 /// Default safety limit for NUL-terminated guest strings.

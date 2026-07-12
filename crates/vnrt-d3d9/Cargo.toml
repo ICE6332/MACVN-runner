@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tracing.workspace = true
 vnrt-win32 = { path = "../vnrt-win32" }
 
 [lints]

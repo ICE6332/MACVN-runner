@@ -169,8 +169,15 @@ Startup then reaches a modal `DialogBoxParamA`. `WM_INITDIALOG` may pump
 queued rather than force-injected as a second Host callback. `EndDialog` must
 complete the **modal DialogBox Host frame** (marked at open), not the nested
 `DispatchMessage` frame that may be the top of the suspend stack—otherwise the
-outer dialog never returns and the Guest stays in Peek/Sleep. With that fix,
-the next expected milestones are remaining init, then `Direct3DCreate9`.
+outer dialog never returns and the Guest stays in Peek/Sleep. With that fix, the next expected milestones are remaining init, then
+`Direct3DCreate9`.
+
+`d3d9.dll` no longer returns a null factory: `Direct3DCreate9` builds a Guest
+`IDirect3D9` COM object with a Host-thunk vtable, and `CreateDevice` builds a
+full-order `IDirect3DDevice9` vtable plus texture/buffer helpers
+(`CreateTexture`, `LockRect`/`UnlockRect` with wgpu upload, `Present` stub).
+Method bodies stay target-driven; slots the census has not exercised yet return
+`D3D_OK` safely.
 
 `DecodePointer(NULL)` now returns NULL (Encode still cookie-xors null to a
 non-null token), matching native CRT expectations for empty handler slots.
